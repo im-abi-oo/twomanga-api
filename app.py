@@ -3,12 +3,11 @@ import datetime
 import bcrypt
 import requests
 import json
-import traceback
 import uuid
 import threading
 import time
 from functools import wraps
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_pymongo import PyMongo
 from flask_cors import CORS 
 from flask_jwt_extended import (
@@ -23,8 +22,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-# تنظیمات CORS برای ارتباط ایمن با فرانت‌سند استاتیک
-CORS(app, resources={r"/*": {"origins": "*"}}) 
+# غیرفعال کردن حساسیت به اسلش انتهایی (جلوگیری از 404 های رایج)
+app.url_map.strict_slashes = False
+
+# --- [هوشمندسازی CORS] ---
+# در فایل .env دامنه‌های خود را با کاما جدا کنید: ALLOWED_ORIGINS=https://site.com,http://localhost:3000
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
+CORS(app, resources={
+    r"/*": {
+        "origins": allowed_origins,
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Admin-Secret"],
+        "expose_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True,
+        "max_age": 600 # کش کردن Preflight برای بهبود سرعت
+    }
+})
 
 # --- پیکربندی سیستم ---
 app.config["MONGO_URI"] = os.getenv("MONGO_URI")
@@ -70,7 +84,7 @@ def single_session_required(fn):
 
 # --- [توابع کمکی تلگرام] ---
 def send_tg(chat_id, text, markup=None):
-    if not TELEGRAM_BOT_TOKEN: return
+    if not TELEGRAM_BOT_TOKEN or not chat_id: return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
     if markup: payload['reply_markup'] = json.dumps(markup)
@@ -81,7 +95,9 @@ def send_tg(chat_id, text, markup=None):
 @app.route('/auth/register', methods=['POST'])
 def register():
     data = request.get_json()
-    u, p, t = data.get('username','').strip().lower(), data.get('password'), data.get('telegram_id','').strip()
+    if not data: return jsonify({"msg": "دیتای ورودی یافت نشد"}), 400
+    
+    u, p, t = data.get('username','').strip().lower(), data.get('password',''), data.get('telegram_id','').strip()
     if not all([u, p, t]) or len(p) < 6:
         return jsonify({"msg": "اطلاعات ناقص یا رمز عبور کوتاه است"}), 400
     
@@ -99,8 +115,10 @@ def register():
 @app.route('/auth/login', methods=['POST'])
 def login():
     data = request.get_json()
+    if not data: return jsonify({"msg": "اطلاعات وارد نشده"}), 400
+    
     user = mongo.db.users.find_one({'username': data.get('username','').strip().lower()})
-    if user and bcrypt.checkpw(data.get('password').encode('utf-8'), user['password']):
+    if user and bcrypt.checkpw(data.get('password','').encode('utf-8'), user['password']):
         salt = str(uuid.uuid4())
         mongo.db.users.update_one({'_id': user['_id']}, {'$set': {'session_salt': salt}})
         at = create_access_token(identity=user['username'], additional_claims={"session_salt": salt})
@@ -183,41 +201,47 @@ def admin_webhook():
         return jsonify({"status": "ok"}), 200
     except: return "Error", 400
 
-# --- [بات تلگرام داخلی برای پردازش دکمه‌ها] ---
+# --- [بات تلگرام داخلی] ---
 def run_telegram_bot():
-    """این تابع کلیک روی دکمه‌های تلگرام را بدون نیاز به سرور جداگانه مدیریت می‌کند"""
     print("🤖 Internal Telegram Bot Listener Started...")
     offset = 0
+    port = int(os.getenv("PORT", 5001))
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
-            resp = requests.get(url).json()
+            resp = requests.get(url, timeout=35).json()
             if not resp.get("ok"): continue
             
             for update in resp.get("result", []):
                 offset = update["update_id"] + 1
                 if "callback_query" in update:
-                    # ارسال اطلاعات کلیک شده به اندپوینت وب‌هوک خودمان
+                    # ارسال به خودمان (لوکال)
                     requests.post(
-                        f"http://127.0.0.1:{os.getenv('PORT', 5001)}/admin/webhook",
+                        f"http://127.0.0.1:{port}/admin/webhook",
                         json={"callback_data": update["callback_query"]["data"]},
-                        headers={"X-Admin-Secret": ADMIN_SECRET_KEY}
+                        headers={"X-Admin-Secret": ADMIN_SECRET_KEY},
+                        timeout=5
                     )
-                    # اطلاع به تلگرام که دستور دریافت شد
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", 
                                  json={"callback_query_id": update["callback_query"]["id"], "text": "درخواست پردازش شد"})
-        except Exception: time.sleep(5)
+        except: time.sleep(10)
 
-# --- [مدیریت خطاها] ---
+# --- [مدیریت خطاهای ۴۰۴ و ۵۰۰] ---
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"msg": "متاسفم اما نمیشه؛ آدرس یافت نشد", "path": request.path}), 404
+
 @app.errorhandler(Exception)
 def handle_exception(e):
-    err = f"🆘 **Backend Crash**\n`{str(e)}`"
-    for admin in ADMIN_IDS: send_tg(admin, err)
+    # برای خطاهای غیرمنتظره به ادمین پیام بده
+    err_msg = f"🆘 **Backend Crash**\n`{str(e)}`"
+    print(err_msg)
+    for admin in ADMIN_IDS: send_tg(admin, err_msg)
     return jsonify({"msg": "Internal Server Error"}), 500
 
 if __name__ == '__main__':
     setup_database()
-    # اجرای بات تلگرام در یک ترد جداگانه
     threading.Thread(target=run_telegram_bot, daemon=True).start()
     
+    # اجرای برنامه روی پورت مورد نظر
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 5001)), debug=False)
