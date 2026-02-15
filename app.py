@@ -1,4 +1,4 @@
-# app.py (UPDATED - full)
+# app.py (FINAL - full, ready to run)
 import os
 import uuid
 import json
@@ -16,6 +16,7 @@ from flask_jwt_extended import (
 )
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flask_cors import CORS
 from marshmallow import Schema, fields, ValidationError, validates
 from pymongo import ASCENDING, DESCENDING, errors as pymongo_errors
 from bson.objectid import ObjectId
@@ -53,6 +54,9 @@ EXPLORER_URLS = os.getenv("EXPLORER_URLS", "")  # e.g. "https://api.tronscan.org
 ENABLE_RATE_SCHEDULER = os.getenv("ENABLE_RATE_SCHEDULER", "false").lower() == "true"
 RATE_FETCH_MINUTES = int(os.getenv("RATE_FETCH_MINUTES", "60"))
 
+# FRONTEND_ORIGINS for CORS (comma-separated). Default to common dev origin.
+FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000")
+
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -69,19 +73,28 @@ app.config["JWT_ACCESS_TOKEN_EXPIRES"] = datetime.timedelta(hours=ACCESS_EXPIRES
 app.config["JWT_REFRESH_TOKEN_EXPIRES"] = datetime.timedelta(days=REFRESH_EXPIRES_DAYS)
 
 # PyMongo client
-# Note: you can tune connectTimeoutMS, serverSelectionTimeoutMS via MONGO_URI query params if needed
 mongo = PyMongo(app)
 
 # JWT
 jwt = JWTManager(app)
 
 # Rate limiter
-# Use init_app to avoid signature issues across versions of flask-limiter
 limiter = Limiter(
     key_func=get_remote_address,
     default_limits=["200 per day", "50 per hour"],
 )
 limiter.init_app(app)
+
+# CORS setup
+# FRONTEND_ORIGINS may be a comma-separated list or "*"
+origins_raw = FRONTEND_ORIGINS.strip()
+if origins_raw == "*" or origins_raw == "":
+    origins = "*"
+else:
+    # split and strip
+    origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
+# apply CORS (allow credentials because JWT cookie or fetch with credentials might be used)
+CORS(app, resources={r"/*": {"origins": origins}}, supports_credentials=True)
 
 # ---------- Schemas (Validation) ----------
 
@@ -130,7 +143,6 @@ def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         try:
-            # ensure jwt present & valid
             verify_jwt_in_request()
             identity = get_jwt_identity()
             if not identity:
@@ -185,11 +197,9 @@ def setup_database():
         mongo.db.transactions.create_index([("tx_hash", ASCENDING)], unique=True, sparse=True)
         mongo.db.coupons.create_index([("code", ASCENDING)], unique=True)
         mongo.db.rates.create_index([("ts", DESCENDING)])
-        # optional: logs/temporary ttl index example (commented out)
         logger.info("Database indices ensured.")
     except Exception as e:
         logger.exception("Error creating indices: %s", e)
-        # bubble up in import-time initialization would stop the app so that ops notices
         raise
 
 def seed_admin_roles():
@@ -202,14 +212,11 @@ def seed_admin_roles():
             logger.exception("Failed applying admin role for %s", u)
     logger.info("Admin usernames applied to existing users (if present).")
 
-# call at import/startup so indices exist before handling requests
 try:
     setup_database()
     seed_admin_roles()
 except Exception:
     logger.exception("Database setup failed at startup")
-    # Depending on deployment preference, you may want to re-raise to prevent startup.
-    # For now, continue so process doesn't crash unexpectedly in some environments.
 
 # ---------- Error Handling ----------
 
@@ -291,7 +298,6 @@ def login():
 @jwt_required(refresh=True)
 def refresh():
     try:
-        # verify jwt and ensure the session_salt still matches DB (prevent using old refresh token)
         verify_jwt_in_request()
         claims = get_jwt()
         identity = get_jwt_identity()
@@ -308,6 +314,31 @@ def refresh():
         logger.exception("refresh error")
         return jsonify({"msg": "internal error"}), 500
 
+# New endpoint requested: /auth/me -> returns full profile info
+@app.route("/auth/me", methods=["GET"])
+@jwt_required()
+@single_session_required
+def auth_me():
+    try:
+        user = g.current_user
+        now = datetime.datetime.utcnow()
+        exp = user.get("expiryDate")
+        is_premium = bool(exp and exp > now)
+        days_left = (exp - now).days if is_premium else 0
+        # safe response serialization
+        return jsonify({
+            "username": user.get("username"),
+            "role": user.get("role", "user"),
+            "is_premium": is_premium,
+            "days_left": days_left,
+            "expiry_date": exp.isoformat() if isinstance(exp, datetime.datetime) else None,
+            "created_at": user.get("created_at").isoformat() if isinstance(user.get("created_at"), datetime.datetime) else None,
+            "total_purchases": int(user.get("total_purchases", 0))
+        }), 200
+    except Exception:
+        logger.exception("auth_me error")
+        return jsonify({"msg": "internal error"}), 500
+
 @app.route("/api/user/status", methods=["GET"])
 @jwt_required()
 @single_session_required
@@ -322,7 +353,7 @@ def get_status():
             "username": user["username"],
             "is_premium": is_premium,
             "days_left": days_left,
-            "expiry_date": exp.isoformat() if exp else None,
+            "expiry_date": exp.isoformat() if isinstance(exp, datetime.datetime) else None,
             "total_purchases": user.get("total_purchases", 0)
         }), 200
     except Exception:
@@ -332,14 +363,7 @@ def get_status():
 # ---------- Payments & Coupons ----------
 
 def verify_tx_on_chain(tx_hash: str) -> bool:
-    """
-    Configurable verification:
-    - If EXPLORER_URLS env var provided (comma-separated urls containing {tx_hash}), try each and treat HTTP 200 as success.
-    - Otherwise fallback to minimal local sanity check (length).
-    This design lets you plug in real explorer endpoints without hard-coding specific providers.
-    """
     try:
-        # basic sanity
         if not tx_hash or len(tx_hash) < 8:
             return False
 
@@ -349,16 +373,13 @@ def verify_tx_on_chain(tx_hash: str) -> bool:
                 try:
                     url = template.replace("{tx_hash}", tx_hash)
                     r = requests.get(url, timeout=5)
-                    # treat 200 as probable existence; explorers vary in schema, so keep it permissive
                     if r.status_code == 200:
                         logger.info("Explorer validated tx via %s", url)
                         return True
                 except Exception:
                     continue
-            # if none validated, return False
             return False
 
-        # no explorers configured -> fallback permissive
         return True
     except Exception:
         logger.exception("verify_tx_on_chain error")
@@ -382,7 +403,6 @@ def submit_payment():
             if not c:
                 return jsonify({"msg": "invalid coupon"}), 400
             now = datetime.datetime.utcnow()
-            # coupon usage constraints
             if c.get("expires_at") and c["expires_at"] < now:
                 return jsonify({"msg": "coupon expired"}), 400
             max_uses = c.get("max_uses")
@@ -398,16 +418,11 @@ def submit_payment():
         if not tx_hash:
             return jsonify({"msg": "tx_hash or coupon required"}), 400
 
-        # basic tx_hash validation + uniqueness
         if mongo.db.transactions.find_one({"tx_hash": tx_hash}):
             return jsonify({"msg": "tx_hash already submitted"}), 400
 
-        # verify on chain if possible (this may call configured explorers)
         verified = verify_tx_on_chain(tx_hash)
-        if not verified:
-            status = "pending_verification"
-        else:
-            status = "pending"
+        status = "pending" if verified else "pending_verification"
 
         tx_doc = {
             "user_id": user["_id"],
@@ -420,7 +435,6 @@ def submit_payment():
         try:
             inserted = mongo.db.transactions.insert_one(tx_doc)
         except pymongo_errors.DuplicateKeyError:
-            # race: another request inserted same tx_hash concurrently
             return jsonify({"msg": "tx_hash already exists"}), 400
 
         tx_id = str(inserted.inserted_id)
@@ -431,7 +445,7 @@ def submit_payment():
         logger.exception("submit_payment error")
         return jsonify({"msg": "internal error"}), 500
 
-# Admin endpoints to approve/reject payments
+# Admin endpoints
 
 @app.route("/admin/transactions/<tx_id>/approve", methods=["POST"])
 @jwt_required()
@@ -555,24 +569,11 @@ def list_coupons():
 # ---------- Rates fetching & public endpoint ----------
 
 def fetch_and_store_rates():
-    """
-    Fetch rates from configured external services and store a snapshot in mongo.db.rates.
-    Stored format example:
-    {
-      "ts": datetime,
-      "USDT": 160000,
-      "TRX": 5000,
-      "TON": 45000,
-      "SOL": 2000000
-    }
-    """
     try:
         out = {"ts": datetime.datetime.utcnow()}
-        # 1) Try BrsApi (USDT -> Toman)
         try:
             brs_url = BRSAPI_URL
             if BRSAPI_KEY:
-                # if API expects key param
                 if "?" in brs_url:
                     brs_url = f"{brs_url}&key={BRSAPI_KEY}"
                 else:
@@ -601,7 +602,6 @@ def fetch_and_store_rates():
         except Exception:
             logger.exception("brsapi fetch failed")
 
-        # 2) Nobitex stats: latest in RIAL => convert to Toman
         try:
             base = NOBITEX_STATS_URL
             for code, sym in (("trx","TRX"), ("usdt","USDT"), ("ton","TON"), ("sol","SOL")):
@@ -624,7 +624,6 @@ def fetch_and_store_rates():
             return False
 
         mongo.db.rates.insert_one(out)
-        # keep only recent history (e.g., 7 days)
         cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=7)
         mongo.db.rates.delete_many({"ts": {"$lt": cutoff}})
         logger.info("Rates stored: %s", out)
@@ -635,9 +634,6 @@ def fetch_and_store_rates():
 
 @app.route("/public/rates", methods=["GET"])
 def public_rates():
-    """
-    Returns latest cached rates. If nothing cached, 404.
-    """
     try:
         last = mongo.db.rates.find_one(sort=[("ts", DESCENDING)])
         if not last:
@@ -669,12 +665,6 @@ def admin_fetch_rates():
 @jwt_required()
 @single_session_required
 def user_transactions():
-    """
-    Return transactions for the authenticated user.
-    Query params:
-      - limit (default 50, max 200)
-      - status (optional) to filter by status
-    """
     try:
         user = g.current_user
         try:
@@ -700,10 +690,6 @@ def user_transactions():
         logger.exception("user_transactions error")
         return jsonify({"msg": "internal error"}), 500
 
-# ---------- Coupons Management (Admin) continued (already above) ----------
-
-# (create_coupon and list_coupons already defined earlier)
-
 # ---------- Utilities ----------
 
 @app.route("/debug/ping", methods=["GET"])
@@ -711,6 +697,7 @@ def ping():
     return jsonify({"msg": "pong"}), 200
 
 # ---------- Optional scheduler setup (APScheduler) ----------
+
 if ENABLE_RATE_SCHEDULER:
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
@@ -726,7 +713,6 @@ if ENABLE_RATE_SCHEDULER:
 if __name__ == "__main__":
     try:
         logger.info("Starting Two Manga API on port %s", APP_PORT)
-        # In production prefer a WSGI server (gunicorn/uvicorn with multiple workers)
         app.run(host="0.0.0.0", port=APP_PORT, debug=False)
     except Exception:
         logger.exception("Failed to start application")
