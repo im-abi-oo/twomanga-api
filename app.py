@@ -616,6 +616,25 @@ def login():
     except Exception:
         logger.exception("login error")
         return jsonify({"msg": "internal error"}), 500
+        
+@app.route("/auth/me", methods=["GET"])
+@jwt_required()
+@single_session_required
+def get_me():
+    try:
+        user = g.current_user
+        if not user:
+            return jsonify({"msg": "user not found"}), 404
+        
+        return jsonify({
+            "username": user.get("username"),
+            "role": user.get("role", "user"),
+            "expiryDate": user.get("expiryDate").isoformat() if user.get("expiryDate") else None,
+            "created_at": user.get("created_at").isoformat() if user.get("created_at") else None
+        }), 200
+    except Exception:
+        logger.exception("get_me error")
+        return jsonify({"msg": "internal error"}), 500
 
 @app.route("/auth/refresh", methods=["POST"])
 @jwt_required(refresh=True)
