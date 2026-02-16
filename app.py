@@ -233,7 +233,7 @@ class RegisterSchema(Schema):
     password = fields.Str(required=True)
     
     @validates("username")
-    def validate_username(self, val):
+    def validate_username(self, val, **kwargs):
         if len(val.strip()) < 3 or " " in val:
             raise ValidationError("Invalid username format")
 
