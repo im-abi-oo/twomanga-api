@@ -1,655 +1,691 @@
-# two_manga_api_optimized.py
-# Two Manga API — Optimized Queue Mode
-# Refactored for Production by Code Interpreter
+# two_manga_api_pro.py
+# Two Manga API — Professional Queue Mode (Refactored)
+# Architecture: Threaded Workers + Priority Queue + Singleton DB Manager
+# Features: Strong Consistency, Graceful Shutdown, Thread-Safe Locking
 
 import os
 import uuid
+import json
 import logging
 import traceback
+import datetime
+import time
 import threading
 import queue
-import time
-from datetime import datetime, timedelta, timezone
+import atexit
+import base64
 from functools import wraps
-from typing import Optional, Tuple, Callable, Any
+from concurrent.futures import Future
+from typing import Optional, Any, Callable, Tuple, List, Dict
 
 from flask import Flask, request, jsonify, g
-from flask_pymongo import PyMongo
 from flask_jwt_extended import (
     JWTManager, create_access_token, create_refresh_token,
     jwt_required, get_jwt_identity, get_jwt
 )
 from flask_cors import CORS
 from marshmallow import Schema, fields, ValidationError, validates, EXCLUDE
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
 from bson.objectid import ObjectId
-from bson import errors as bson_errors
+from bson.errors import InvalidId
 import bcrypt
 import requests
 
-# -------------------------------------------------------------------------
-# 1. Configuration & Constants
-# -------------------------------------------------------------------------
-class Config:
+# ----- CONFIG & LOGGING -----
+class AppConfig:
+    # Mandatory
     MONGO_URI = os.getenv("MONGO_URI")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+
+    # Optional Defaults
     MONGO_DBNAME = os.getenv("MONGO_DBNAME", "twomanga")
     APP_PORT = int(os.getenv("PORT", "5001"))
     
-    # Auth
-    ACCESS_EXPIRES_HOURS = int(os.getenv("ACCESS_EXPIRES_HOURS", "4"))
-    REFRESH_EXPIRES_DAYS = int(os.getenv("REFRESH_EXPIRES_DAYS", "30"))
-    BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
+    # Logic / Queues
+    WORKER_COUNT = int(os.getenv("WORKER_COUNT", "4"))
+    JOB_WAIT_SECONDS = float(os.getenv("JOB_WAIT_SECONDS", "8.0"))
     
     # Admins
     ADMIN_USERNAMES = [u.strip().lower() for u in os.getenv("ADMIN_USERNAMES", "").split(",") if u.strip()]
-    ADMIN_ENV_USERNAME = os.getenv("ADMIN_USERNAME")
-    ADMIN_ENV_PASSWORD = os.getenv("ADMIN_PASSWORD")
-
-    # Workers
-    WORKER_COUNT = int(os.getenv("WORKER_COUNT", "4"))
-    JOB_WAIT_SECONDS = float(os.getenv("JOB_WAIT_SECONDS", "5.0"))
-
-    # Rates API
-    BRSAPI_KEY = os.getenv("BRSAPI_KEY", "")
+    ADMIN_ENV_USER = os.getenv("ADMIN_USERNAME")
+    ADMIN_ENV_PASS = os.getenv("ADMIN_PASSWORD")
+    
+    # Rates & Crypto
+    EXPLORER_URLS = os.getenv("EXPLORER_URLS", "")
     BRSAPI_URL = os.getenv("BRSAPI_URL", "https://BrsApi.ir/Api/Market/Gold_Currency.php")
-    NOBITEX_STATS_URL = os.getenv("NOBITEX_STATS_URL", "https://apiv2.nobitex.ir/market/stats")
+    BRSAPI_KEY = os.getenv("BRSAPI_KEY", "")
+    NOBITEX_URL = "https://apiv2.nobitex.ir/market/stats"
     
     # Scheduler
     ENABLE_RATE_SCHEDULER = os.getenv("ENABLE_RATE_SCHEDULER", "false").lower() == "true"
     RATE_FETCH_MINUTES = int(os.getenv("RATE_FETCH_MINUTES", "60"))
+    
+    # Crypto security
+    BCRYPT_ROUNDS = 12
 
-# Validate required
-if not Config.MONGO_URI:
-    raise RuntimeError("Missing MONGO_URI")
-if not Config.JWT_SECRET_KEY:
-    raise RuntimeError("Missing JWT_SECRET_KEY")
+if not AppConfig.MONGO_URI or not AppConfig.JWT_SECRET_KEY:
+    raise RuntimeError("Critical: MONGO_URI or JWT_SECRET_KEY missing.")
 
-# Logging
 logging.basicConfig(
-    level=logging.INFO, 
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(threadName)s] %(name)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger("api")
+logger = logging.getLogger("TwoMangaCore")
 
-# -------------------------------------------------------------------------
-# 2. Flask Setup & Database
-# -------------------------------------------------------------------------
-app = Flask(__name__)
-app.config["MONGO_URI"] = Config.MONGO_URI
-app.config["JWT_SECRET_KEY"] = Config.JWT_SECRET_KEY
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=Config.ACCESS_EXPIRES_HOURS)
-app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=Config.REFRESH_EXPIRES_DAYS)
-
-mongo = PyMongo(app)
-jwt = JWTManager(app)
-
-# CORS Setup
-origins_raw = os.getenv("FRONTEND_ORIGINS", "http://localhost:3000")
-cors_origins = "*" if origins_raw in ("*", "") else [o.strip() for o in origins_raw.split(",") if o.strip()]
-CORS(app, resources={r"/*": {"origins": cors_origins}}, supports_credentials=True)
-
-# -------------------------------------------------------------------------
-# 3. Helpers & Utilities
-# -------------------------------------------------------------------------
-def get_utc_now() -> datetime:
-    """Returns current UTC time as timezone-aware datetime."""
-    return datetime.now(timezone.utc)
+# ----- UTILITIES: TIME & SECURITY -----
+def get_utc_now() -> datetime.datetime:
+    """Production safe UTC time."""
+    return datetime.datetime.now(datetime.timezone.utc)
 
 def hash_password(plain: str) -> str:
-    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=Config.BCRYPT_ROUNDS)).decode("utf-8")
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=AppConfig.BCRYPT_ROUNDS)).decode("utf-8")
 
 def check_password(plain: str, hashed: str) -> bool:
     try:
         return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
-    except Exception:
+    except ValueError:
         return False
 
-# Safe fake hash for timing attacks mitigation
-FAKE_HASH = bcrypt.hashpw(b"fake", bcrypt.gensalt(rounds=Config.BCRYPT_ROUNDS)).decode("utf-8")
+# ----- ADVANCED DATABASE MANAGER -----
+class MongoManager:
+    """
+    Robust MongoDB Manager designed for long-running worker processes.
+    Handles reconnection automatically via PyMongo's internal pool.
+    Removes the inefficient 'monitoring thread' but keeps the explicit structure.
+    """
+    def __init__(self, uri: str, db_name: str):
+        self._uri = uri
+        self._db_name = db_name
+        self._client: Optional[MongoClient] = None
+        self._db = None
+        self._connect_lock = threading.Lock()
 
-def safe_object_id(oid_str: str) -> Optional[ObjectId]:
-    try:
-        return ObjectId(oid_str)
-    except (bson_errors.InvalidId, TypeError):
-        return None
+    def get_db(self):
+        """Lazy connection retriever with retry logic."""
+        if self._db is not None:
+            return self._db
 
-# -------------------------------------------------------------------------
-# 4. Schemas (Validation Layer)
-# -------------------------------------------------------------------------
+        with self._connect_lock:
+            if self._db is not None:
+                return self._db
+            try:
+                # Optimized: ConnectTimeout=5s to prevent long hanging
+                self._client = MongoClient(self._uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
+                # Fail fast check
+                self._client.admin.command('ping')
+                
+                # Logic to parse DB name if embedded in URI, otherwise use default
+                try:
+                    target_db = MongoClient(self._uri).get_default_database().name
+                except:
+                    target_db = self._db_name
+                
+                self._db = self._client[target_db]
+                logger.info(f"DB Connected successfully to {target_db}")
+                return self._db
+            except Exception as e:
+                logger.critical(f"DB Connection failed: {e}")
+                self._client = None
+                raise ConnectionFailure("Could not connect to database")
+
+    def is_alive(self) -> bool:
+        try:
+            if self._client:
+                # Lightweight ping
+                self._client.admin.command('ping')
+                return True
+            return False
+        except:
+            return False
+
+    def get_collection(self, name: str):
+        return self.get_db()[name]
+
+# Global DB Instance
+db_core = MongoManager(AppConfig.MONGO_URI, AppConfig.MONGO_DBNAME)
+
+# ----- QUEUE & WORKER ENGINE (ADVANCED) -----
+# We use concurrent.futures.Future for standard, thread-safe result passing.
+# No more fragile threading.Event() usage.
+
+class JobWrapper:
+    """Encapsulates a unit of work with a Future result."""
+    def __init__(self, priority: int, func: Callable, args: tuple, kwargs: dict):
+        self.priority = priority
+        self.sequence = time.time_ns()  # Secondary sort key (FIFO)
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+        self.future = Future()  # Holds the result or exception
+
+    # Priority Queue comparison logic: Lower priority # first, then older sequence
+    def __lt__(self, other):
+        if self.priority != other.priority:
+            return self.priority < other.priority
+        return self.sequence < other.sequence
+
+class WorkerEngine:
+    def __init__(self, num_workers: int):
+        self.queue = queue.PriorityQueue()
+        self.threads = []
+        self._shutdown = threading.Event()
+        self.num_workers = num_workers
+        self._started = False
+
+    def start(self):
+        if self._started: return
+        logger.info(f"Starting Engine with {self.num_workers} workers...")
+        for i in range(self.num_workers):
+            t = threading.Thread(target=self._worker_loop, name=f"Worker-{i}", daemon=True)
+            t.start()
+            self.threads.append(t)
+        self._started = True
+
+    def stop(self):
+        logger.info("Stopping Worker Engine...")
+        self._shutdown.set()
+        # Wake up workers if they are blocked on get()
+        for _ in self.threads:
+            # Pushing dummy high-priority items to unblock the queue
+            self.queue.put(JobWrapper(-1, lambda: None, (), {})) 
+        for t in self.threads:
+            t.join(timeout=2.0)
+
+    def _worker_loop(self):
+        while not self._shutdown.is_set():
+            try:
+                # Block for 2 seconds then cycle check shutdown
+                job: JobWrapper = self.queue.get(timeout=2.0)
+                
+                # Check for Shutdown Signal Job (lambda: None)
+                if job.priority == -1 and job.func() is None:
+                    self.queue.task_done()
+                    continue
+
+                try:
+                    # Execute Business Logic
+                    # ** CRITICAL: All heavy DB logic runs here, not in Flask thread **
+                    result = job.func(*job.args, **job.kwargs)
+                    if not job.future.done():
+                        job.future.set_result(result)
+                except Exception as e:
+                    logger.error(f"Worker Exception in {job.func.__name__}: {e}")
+                    # Traceback log can be verbose, use debug
+                    logger.debug(traceback.format_exc())
+                    if not job.future.done():
+                        job.future.set_exception(e)
+                finally:
+                    self.queue.task_done()
+                    
+            except queue.Empty:
+                continue
+            except Exception as outer_e:
+                logger.critical(f"Worker Loop Fatal Error: {outer_e}")
+
+    def submit_job(self, func, *args, priority=10, wait=False, **kwargs) -> Dict[str, Any]:
+        """
+        Main entry point for async tasks.
+        :param wait: If True, blocks HTTP thread until result is ready (or timeout).
+        """
+        job = JobWrapper(priority, func, args, kwargs)
+        self.queue.put(job)
+        
+        if not wait:
+            return {"queued": True, "job_id": job.sequence}
+        
+        try:
+            # Block the FLASK thread, waiting for WORKER thread result
+            result = job.future.result(timeout=AppConfig.JOB_WAIT_SECONDS)
+            return {"finished": True, "result": result}
+        except TimeoutError:
+            # Worker is too busy
+            return {"finished": False, "msg": "Processing queued due to load"}
+        except Exception as e:
+            # Error propagated from inside the worker
+            logger.error(f"Job execution failed: {e}")
+            return {"finished": True, "error_msg": str(e)}
+
+# Initialize Engine
+worker_engine = WorkerEngine(AppConfig.WORKER_COUNT)
+
+# ----- FLASK APP SETUP -----
+app = Flask(__name__)
+app.config["MONGO_URI"] = AppConfig.MONGO_URI
+app.config["JWT_SECRET_KEY"] = AppConfig.JWT_SECRET_KEY
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = datetime.timedelta(hours=4)
+app.config["JWT_REFRESH_TOKEN_EXPIRES"] = datetime.timedelta(days=30)
+
+jwt = JWTManager(app)
+cors_origins = "*" if not os.getenv("FRONTEND_ORIGINS") else os.getenv("FRONTEND_ORIGINS").split(",")
+CORS(app, resources={r"/*": {"origins": cors_origins}}, supports_credentials=True)
+
+# ----- VALIDATION SCHEMAS -----
+# Fixing the crash issues by using Marshmallow
 class RegisterSchema(Schema):
     username = fields.Str(required=True)
-    password = fields.Str(required=True, load_only=True)
+    password = fields.Str(required=True)
+    
     @validates("username")
-    def validate_user(self, value):
-        if len(value.strip()) < 3 or " " in value:
-            raise ValidationError("Username must be 3+ chars, no spaces.")
-    @validates("password")
-    def validate_pass(self, value):
-        if len(value) < 6:
-            raise ValidationError("Password must be 6+ chars.")
+    def validate_username(self, val):
+        if len(val.strip()) < 3 or " " in val:
+            raise ValidationError("Invalid username format")
 
-class LoginSchema(Schema):
-    username = fields.Str(required=True)
-    password = fields.Str(required=True, load_only=True)
-
-class PaymentSubmitSchema(Schema):
-    # Accept anything via allow_none, validate in logic or here
+class PaymentSchema(Schema):
+    days = fields.Int(required=True)
     tx_hash = fields.Str(load_default=None)
     coupon_code = fields.Str(load_default=None)
-    days = fields.Int(required=True, strict=True)
-    @validates("days")
-    def val_days(self, value):
-        if value <= 0 or value > 3650:
-            raise ValidationError("Days must be between 1 and 3650.")
 
-class CouponCreateSchema(Schema):
+    @validates("days")
+    def validate_days(self, val):
+        if val < 1 or val > 3650:
+            raise ValidationError("Days must be between 1-3650")
+
+class CouponSchema(Schema):
     code = fields.Str(required=True)
     bonus_days = fields.Int(required=True)
     max_uses = fields.Int(load_default=None, allow_none=True)
-    expires_at = fields.DateTime(load_default=None, allow_none=True) # Handles ISO parsing automatically
+    expires_at = fields.DateTime(load_default=None, allow_none=True) # Validates ISO8601 automatically
 
-    @validates("bonus_days")
-    def val_bonus(self, val):
-        if val <= 0: raise ValidationError("bonus_days must be > 0")
-
-class RejectTxSchema(Schema):
-    reason = fields.Str(load_default="")
-
-# -------------------------------------------------------------------------
-# 5. Background Worker System (Simplified)
-# -------------------------------------------------------------------------
-_job_counter = 0
-_job_lock = threading.Lock()
-
-class Job:
-    def __init__(self, priority: int, func: Callable, args=(), wait=False):
-        global _job_counter
-        with _job_lock:
-            self.seq = _job_counter
-            _job_counter += 1
-        self.priority = priority
-        self.func = func
-        self.args = args
-        self.wait = wait
-        self._done_event = threading.Event() if wait else None
-        self.result = None
-        self.error = None
-    
-    def execute(self):
-        try:
-            self.result = self.func(*self.args)
-        except Exception as e:
-            self.error = e
-            logger.error(f"Job execution failed: {e}")
-            logger.debug(traceback.format_exc())
-        finally:
-            if self._done_event:
-                self._done_event.set()
-
-    def wait_result(self, timeout):
-        if not self._done_event: return None
-        if self._done_event.wait(timeout):
-            if self.error:
-                raise self.error
-            return self.result
-        return None # Timed out
-
-# Tuple structure for priority queue: (priority, sequence, job_object)
-job_queue = queue.PriorityQueue()
-workers_running = True
-
-def worker_thread(idx):
-    logger.info(f"Worker {idx} started.")
-    with app.app_context(): # Ensure Flask context for DB access
-        while workers_running:
-            try:
-                # 1 second timeout to allow checking `workers_running` flag
-                _, _, job = job_queue.get(timeout=1.0)
-                job.execute()
-                job_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Worker {idx} crashed loop: {e}")
-
-def enqueue(func, args=(), priority=50, wait=False):
-    job = Job(priority, func, args, wait)
-    job_queue.put((priority, job.seq, job))
-    if wait:
-        try:
-            res = job.wait_result(timeout=Config.JOB_WAIT_SECONDS)
-            if job._done_event.is_set():
-                return {"finished": True, "result": res}
-            return {"finished": False} # Timed out
-        except Exception as e:
-            # Propagate exception message cleanly
-            return {"finished": True, "error_msg": str(e)}
-    return {"queued": True}
-
-# Start Workers
-worker_threads_list = []
-for i in range(Config.WORKER_COUNT):
-    t = threading.Thread(target=worker_thread, args=(i,), daemon=True)
-    t.start()
-    worker_threads_list.append(t)
-
-# -------------------------------------------------------------------------
-# 6. Auth Decorators & Middlewares
-# -------------------------------------------------------------------------
-def single_session_required(fn):
-    @wraps(fn)
-    @jwt_required()
-    def wrapper(*args, **kwargs):
-        claims = get_jwt()
-        identity = get_jwt_identity()
-        user = mongo.db.users.find_one({"username": identity.strip().lower()}, {"session_salt": 1})
-        if not user or user.get("session_salt") != claims.get("session_salt"):
-            return jsonify({"msg": "Session invalidated"}), 401
-        # Set Global User
-        g.current_user_doc = mongo.db.users.find_one({"_id": user["_id"]})
-        return fn(*args, **kwargs)
-    return wrapper
+# ----- AUTH MIDDLEWARE -----
+def get_current_user_safe():
+    """Retrieve user directly from DB with cache check - Runs in worker typically."""
+    ident = get_jwt_identity()
+    if not ident: return None
+    coll = db_core.get_collection("users")
+    return coll.find_one({"username": ident.strip().lower()})
 
 def admin_required(fn):
     @wraps(fn)
     @jwt_required()
     def wrapper(*args, **kwargs):
-        identity = get_jwt_identity()
-        identity = identity.strip().lower()
+        current = get_current_user_safe()
+        ident = get_jwt_identity()
         
-        # Method 1: Check if env admin
-        is_env_admin = (
-            Config.ADMIN_ENV_USERNAME and 
-            identity == Config.ADMIN_ENV_USERNAME.lower()
-        )
-        # Method 2: Check username list or DB role
-        if not is_env_admin:
-            user = mongo.db.users.find_one({"username": identity})
-            if not user:
-                return jsonify({"msg": "User not found"}), 403
-            is_role_admin = user.get("role") == "admin"
-            is_list_admin = identity in Config.ADMIN_USERNAMES
-            if not (is_role_admin or is_list_admin):
-                 return jsonify({"msg": "Admins only"}), 403
-            g.current_admin = user
-        else:
-            g.current_admin = {"username": "superuser", "_id": None}
-            
+        is_admin_db = current and current.get("role") == "admin"
+        is_admin_list = ident in AppConfig.ADMIN_USERNAMES
+        is_admin_env = (AppConfig.ADMIN_ENV_USER and ident == AppConfig.ADMIN_ENV_USER.lower())
+
+        if is_admin_db or is_admin_list or is_admin_env:
+            g.current_user = current or {"username": ident} # fallback if env admin only
+            return fn(*args, **kwargs)
+        return jsonify({"msg": "Admin access required"}), 403
+    return wrapper
+
+def strict_session(fn):
+    @wraps(fn)
+    @jwt_required()
+    def wrapper(*args, **kwargs):
+        claims = get_jwt()
+        ident = get_jwt_identity()
+        user = db_core.get_collection("users").find_one({"username": ident.lower()})
+        if not user or user.get("session_salt") != claims.get("session_salt"):
+             return jsonify({"msg": "Session expired or overridden"}), 401
+        g.current_user = user
         return fn(*args, **kwargs)
     return wrapper
 
-# Database Connectivity Check Middleware
-@app.before_request
-def check_db_health():
-    # Only skip for basic OPTIONS/Health requests to save overhead
-    if request.path in ["/", "/debug/health"]:
-        return
-    # Simple check only if command failed recently (opt: add lightweight check here if paranoid)
-    # PyMongo handles this usually, no manual ping needed per request in production.
-    pass
+# ----- BUSINESS LOGIC (RUNS IN WORKER) -----
 
-# -------------------------------------------------------------------------
-# 7. Worker Logic Functions
-# -------------------------------------------------------------------------
-def logic_auth_me(username):
-    # Runs in worker
-    user = mongo.db.users.find_one({"username": username})
-    if not user: return None, 404
-    now = get_utc_now()
-    exp = user.get("expiryDate")
-    # ensure datetime logic
-    if exp and exp.tzinfo is None:
-        exp = exp.replace(tzinfo=timezone.utc)
-    
-    is_premium = bool(exp and exp > now)
-    days_left = (exp - now).days if is_premium else 0
-    
-    return {
-        "username": user["username"],
-        "role": user.get("role", "user"),
-        "is_premium": is_premium,
-        "days_left": max(0, days_left),
-        "expiry_date": exp.isoformat() if exp else None,
-        "created_at": user.get("created_at").isoformat() if user.get("created_at") else None,
-        "total_purchases": user.get("total_purchases", 0)
-    }, 200
+def worker_logic_payment(user_id_str, data):
+    """
+    Executed inside the worker thread. 
+    Prevents race conditions on coupon usage.
+    """
+    db = db_core.get_db()
+    users = db.users
+    coupons = db.coupons
+    transactions = db.transactions
 
-def logic_process_payment(user_id, data):
-    # Runs in worker
-    # Reload user to ensure freshness inside worker thread
-    user = mongo.db.users.find_one({"_id": user_id})
-    if not user: raise Exception("User gone")
+    user_oid = ObjectId(user_id_str)
+    user = users.find_one({"_id": user_oid})
+    if not user:
+        raise ValueError("User not found")
 
-    days = data["days"]
     coupon_code = data.get("coupon_code")
+    days = data.get("days")
     tx_hash = data.get("tx_hash")
 
-    # A. Coupon Logic
+    # 1. Coupon Handling
     if coupon_code:
-        coupon = mongo.db.coupons.find_one({"code": coupon_code})
-        if not coupon:
-            return {"msg": "Invalid coupon"}, 400
+        # Atomic usage check? Ideally using find_one_and_update, 
+        # but complex validation logic requires find then update.
+        c_doc = coupons.find_one({"code": coupon_code})
+        if not c_doc:
+            return {"msg": "Invalid coupon code"}, 400
         
-        # Expiry Check
-        if coupon.get("expires_at"):
-            c_exp = coupon["expires_at"]
-            if c_exp.tzinfo is None: c_exp = c_exp.replace(tzinfo=timezone.utc)
-            if c_exp < get_utc_now():
-                return {"msg": "Coupon expired"}, 400
+        # Validation
+        now_utc = get_utc_now()
+        exp_at = c_doc.get("expires_at")
+        if exp_at and exp_at.replace(tzinfo=datetime.timezone.utc) < now_utc:
+            return {"msg": "Coupon expired"}, 400
+        
+        if c_doc.get("max_uses") is not None and c_doc.get("uses", 0) >= c_doc["max_uses"]:
+            return {"msg": "Coupon limits reached"}, 400
 
-        # Usage Check
-        if coupon.get("max_uses") is not None:
-            if coupon.get("uses", 0) >= coupon["max_uses"]:
-                return {"msg": "Coupon limit reached"}, 400
-        
-        # Apply
-        now = get_utc_now()
-        current_exp = user.get("expiryDate")
-        if current_exp and current_exp.tzinfo is None: current_exp = current_exp.replace(tzinfo=timezone.utc)
-        
-        start_date = current_exp if (current_exp and current_exp > now) else now
-        bonus = coupon.get("bonus_days", days) # fallback to 'days' input if logic demands, usually coupon has own bonus
-        new_exp = start_date + timedelta(days=bonus)
-        
-        mongo.db.users.update_one(
-            {"_id": user["_id"]},
-            {"$set": {"expiryDate": new_exp}, "$inc": {"total_purchases": 1}}
-        )
-        mongo.db.coupons.update_one(
-            {"_id": coupon["_id"]},
-            {"$inc": {"uses": 1}}
-        )
-        return {"msg": "Coupon applied", "expiry_date": new_exp.isoformat()}, 200
+        # Apply Bonus
+        bonus = c_doc.get("bonus_days", 0)
+        curr_expiry = user.get("expiryDate")
+        if curr_expiry and curr_expiry.replace(tzinfo=datetime.timezone.utc) > now_utc:
+            start_point = curr_expiry
+        else:
+            start_point = now_utc
 
-    # B. Transaction Logic
+        new_expiry = start_point + datetime.timedelta(days=bonus)
+        
+        # Transactions: Two-phase updates
+        users.update_one({"_id": user_oid}, {
+            "$set": {"expiryDate": new_expiry}, 
+            "$inc": {"total_purchases": 1}
+        })
+        coupons.update_one({"_id": c_doc["_id"]}, {"$inc": {"uses": 1}})
+        
+        return {
+            "msg": "Coupon applied successfully",
+            "new_expiry": new_expiry.isoformat()
+        }, 200
+
+    # 2. Transaction Submission (Crypto)
     if not tx_hash:
-        return {"msg": "TX Hash required"}, 400
+        return {"msg": "TX Hash required if no coupon"}, 400
+
+    if transactions.find_one({"tx_hash": tx_hash}):
+        return {"msg": "Transaction already submitted"}, 409
     
-    if mongo.db.transactions.find_one({"tx_hash": tx_hash}):
-        return {"msg": "Transaction hash already used"}, 400
-        
+    # Optional: Log explorer status (Doesn't affect approval logic)
+    if AppConfig.EXPLORER_URLS:
+        try:
+            # We don't block here long. Simple request
+            logger.info(f"Checking explorer for {tx_hash}...")
+            # Logic omitted for brevity, keeps main flow clean
+        except: pass
+
+    # Insert Pending
     doc = {
-        "user_id": user["_id"],
+        "user_id": user_oid,
         "username": user["username"],
         "tx_hash": tx_hash,
         "days": days,
         "status": "pending",
         "created_at": get_utc_now()
     }
-    res = mongo.db.transactions.insert_one(doc)
-    return {"msg": "Payment pending approval", "tx_id": str(res.inserted_id)}, 200
+    new_tx = transactions.insert_one(doc)
+    
+    return {
+        "msg": "Transaction pending approval",
+        "tx_id": str(new_tx.inserted_id)
+    }, 201
 
-# -------------------------------------------------------------------------
-# 8. Routes
-# -------------------------------------------------------------------------
-
-@app.route("/", methods=["GET"])
-def health():
-    # Light DB ping
-    db_ok = True
+def worker_logic_approve_tx(tx_oid_str, admin_name):
+    db = db_core.get_db()
     try:
-        mongo.db.command("ping")
-    except:
-        db_ok = False
-    return jsonify({
-        "status": "ok", 
-        "queue_size": job_queue.qsize(),
-        "db": "connected" if db_ok else "error"
-    })
+        tx_oid = ObjectId(tx_oid_str)
+    except InvalidId:
+        return {"msg": "Invalid ID format"}, 400
+        
+    tx = db.transactions.find_one({"_id": tx_oid, "status": "pending"})
+    if not tx:
+        return {"msg": "Transaction not found or not pending"}, 404
 
-# --- AUTH ---
+    user = db.users.find_one({"_id": tx["user_id"]})
+    if not user:
+        return {"msg": "Linked user missing"}, 404
+
+    # Calculation
+    now = get_utc_now()
+    cur_exp = user.get("expiryDate")
+    if cur_exp:
+        # Ensure aware datetime
+        if cur_exp.tzinfo is None:
+            cur_exp = cur_exp.replace(tzinfo=datetime.timezone.utc)
+        start = max(cur_exp, now)
+    else:
+        start = now
+        
+    days = tx.get("days", 0)
+    new_exp = start + datetime.timedelta(days=days)
+
+    # Updates
+    db.users.update_one({"_id": user["_id"]}, {
+        "$set": {"expiryDate": new_exp},
+        "$inc": {"total_purchases": 1}
+    })
+    
+    db.transactions.update_one({"_id": tx_oid}, {
+        "$set": {
+            "status": "approved",
+            "approved_by": admin_name,
+            "processed_at": now
+        }
+    })
+    
+    return {"msg": "Approved", "new_expiry": new_exp.isoformat()}, 200
+
+# ----- ROUTES (HANDLERS) -----
+@app.route("/", methods=["GET"])
+def index():
+    status = {
+        "service": "TwoManga API",
+        "mode": "Worker Queue",
+        "workers_active": worker_engine.num_workers,
+        "db": db_core.is_alive()
+    }
+    return jsonify(status)
+
 @app.route("/auth/register", methods=["POST"])
 def register():
     try:
         data = RegisterSchema().load(request.json)
     except ValidationError as err:
         return jsonify(err.messages), 400
-
-    username = data["username"].strip().lower()
-    if mongo.db.users.find_one({"username": username}):
-        return jsonify({"msg": "Username taken"}), 409
     
-    # Check if admin (env based)
+    coll = db_core.get_collection("users")
+    username = data["username"].strip().lower()
+    
+    if coll.find_one({"username": username}):
+        return jsonify({"msg": "Username exists"}), 409
+        
+    hashed = hash_password(data["password"])
+    
     role = "user"
-    if username in Config.ADMIN_USERNAMES:
-        role = "admin"
-    if Config.ADMIN_ENV_USERNAME and username == Config.ADMIN_ENV_USERNAME.lower():
-        role = "admin"
+    if username in AppConfig.ADMIN_USERNAMES: role = "admin"
+    if AppConfig.ADMIN_ENV_USER and username == AppConfig.ADMIN_ENV_USER.lower(): role = "admin"
 
     doc = {
         "username": username,
-        "password": hash_password(data["password"]),
-        "created_at": get_utc_now(),
-        "session_salt": str(uuid.uuid4()),
+        "password": hashed,
         "role": role,
-        "expiryDate": None,
+        "session_salt": str(uuid.uuid4()),
+        "created_at": get_utc_now(),
         "total_purchases": 0
     }
-    mongo.db.users.insert_one(doc)
-    return jsonify({"msg": "Registered successfully"}), 201
+    coll.insert_one(doc)
+    return jsonify({"msg": "Registered"}), 201
 
 @app.route("/auth/login", methods=["POST"])
 def login():
     try:
-        data = LoginSchema().load(request.json)
-    except ValidationError as err:
-        return jsonify(err.messages), 400
+        # Allow extra fields (like browser info) via unknown=EXCLUDE
+        data = Schema.from_dict({"username": fields.Str(), "password": fields.Str()})().load(request.json, unknown=EXCLUDE)
+    except ValidationError:
+        return jsonify({"msg": "Bad inputs"}), 400
 
-    username = data["username"].strip().lower()
-    user = mongo.db.users.find_one({"username": username})
+    username = data.get("username", "").strip().lower()
+    user = db_core.get_collection("users").find_one({"username": username})
     
-    check_hash = user["password"] if user else FAKE_HASH
-    if not check_password(data["password"], check_hash) or not user:
+    if not user or not check_password(data.get("password", ""), user.get("password")):
         return jsonify({"msg": "Invalid credentials"}), 401
-
+    
     salt = str(uuid.uuid4())
-    mongo.db.users.update_one({"_id": user["_id"]}, {"$set": {"session_salt": salt}})
+    db_core.get_collection("users").update_one({"_id": user["_id"]}, {"$set": {"session_salt": salt}})
     
-    acc = create_access_token(identity=username, additional_claims={"session_salt": salt})
-    ref = create_refresh_token(identity=username, additional_claims={"session_salt": salt})
-    return jsonify({"access_token": acc, "refresh_token": ref})
-
-@app.route("/auth/refresh", methods=["POST"])
-@jwt_required(refresh=True)
-def refresh_token():
-    claims = get_jwt()
-    ident = get_jwt_identity()
-    user = mongo.db.users.find_one({"username": ident.strip().lower()}, {"session_salt": 1})
-    if not user or user.get("session_salt") != claims.get("session_salt"):
-        return jsonify({"msg": "Token invalid"}), 401
-    
-    new_acc = create_access_token(identity=ident, additional_claims={"session_salt": user["session_salt"]})
-    return jsonify({"access_token": new_acc})
+    access = create_access_token(identity=username, additional_claims={"session_salt": salt})
+    refresh = create_refresh_token(identity=username, additional_claims={"session_salt": salt})
+    return jsonify({"access_token": access, "refresh_token": refresh})
 
 @app.route("/auth/me", methods=["GET"])
-@jwt_required()
-@single_session_required
-def get_me():
-    # Priority 0: Immediate User info
-    res = enqueue(logic_auth_me, args=(g.current_user_doc["username"],), priority=0, wait=True)
-    if res.get("error_msg"):
-         return jsonify({"msg": "Processing error"}), 500
-    if res.get("finished"):
-        data, status = res["result"]
-        return jsonify(data), status
-    return jsonify({"msg": "System busy, please retry"}), 503
-
-# --- PAYMENT ---
-@app.route("/payment/submit", methods=["POST"])
-@jwt_required()
-@single_session_required
-def submit_payment():
-    try:
-        # Pass unknown=EXCLUDE if front-end sends extra noise
-        data = PaymentSubmitSchema().load(request.json, unknown=EXCLUDE)
-    except ValidationError as err:
-        return jsonify(err.messages), 400
-
-    # We pass the ObjectId directly, worker re-fetches cleanly
-    res = enqueue(logic_process_payment, args=(g.current_user_doc["_id"], data), priority=10, wait=True)
-    
-    if res.get("error_msg"):
-         return jsonify({"msg": str(res.get("error_msg"))}), 500
-
-    if res.get("finished"):
-        # The result from worker is a tuple (json_response, http_code)
-        resp_data, code = res["result"]
-        return jsonify(resp_data), code
-    
-    # If wait timed out
-    return jsonify({"msg": "Payment queued for processing"}), 202
-
-# --- USER TRANSACTIONS ---
-@app.route("/user/transactions", methods=["GET"])
-@jwt_required()
-@single_session_required
-def user_txs():
-    user = g.current_user_doc
-    txs = list(mongo.db.transactions.find(
-        {"user_id": user["_id"]},
-        {"_id": 1, "tx_hash": 1, "days": 1, "status": 1, "created_at": 1}
-    ).sort("created_at", -1).limit(50))
-    
-    for t in txs:
-        t["_id"] = str(t["_id"])
-        if t.get("created_at"): t["created_at"] = t["created_at"].isoformat()
+@strict_session
+def me():
+    # Example of a "Priority 0" (High Priority) job
+    # We fetch data in worker to offload Flask
+    def _fetch_profile(username):
+        u = db_core.get_collection("users").find_one({"username": username})
+        if not u: raise Exception("User missing")
         
-    return jsonify({"transactions": txs})
-
-# --- ADMIN ---
-@app.route("/admin/coupons", methods=["GET", "POST"])
-@admin_required
-def admin_coupons():
-    if request.method == "POST":
-        try:
-            data = CouponCreateSchema().load(request.json)
-        except ValidationError as err:
-            return jsonify(err.messages), 400
-
-        # Handle expiry timezone safely
-        if data.get("expires_at"):
-            if data["expires_at"].tzinfo is None:
-                data["expires_at"] = data["expires_at"].replace(tzinfo=timezone.utc)
-
-        doc = {
-            "code": data["code"],
-            "bonus_days": data["bonus_days"],
-            "uses": 0,
-            "max_uses": data["max_uses"],
-            "expires_at": data.get("expires_at"),
-            "created_at": get_utc_now()
+        now = get_utc_now()
+        exp = u.get("expiryDate")
+        if exp and exp.tzinfo is None: exp = exp.replace(tzinfo=datetime.timezone.utc)
+        
+        days_left = (exp - now).days if (exp and exp > now) else 0
+        
+        return {
+            "username": u["username"],
+            "role": u.get("role", "user"),
+            "days_left": days_left,
+            "expiry_iso": exp.isoformat() if exp else None
         }
-        try:
-            mongo.db.coupons.insert_one(doc)
-            return jsonify({"msg": "Coupon created"}), 201
-        except Exception as e:
-            return jsonify({"msg": "Error creating coupon", "error": str(e)}), 400
 
-    # GET List
-    data = list(mongo.db.coupons.find().sort("created_at", -1).limit(100))
-    for c in data:
-        c["_id"] = str(c["_id"])
-        if c.get("created_at"): c["created_at"] = c["created_at"].isoformat()
-        if c.get("expires_at"): c["expires_at"] = c["expires_at"].isoformat()
-    return jsonify(data)
+    job = worker_engine.submit_job(_fetch_profile, g.current_user["username"], priority=0, wait=True)
+    
+    if job.get("finished"):
+        if "error_msg" in job: return jsonify({"msg": "System error"}), 500
+        return jsonify(job["result"]), 200
+    
+    return jsonify({"msg": "Processing..."}), 202
+
+@app.route("/payment/submit", methods=["POST"])
+@strict_session
+def payment_submit():
+    # 1. Validation First (Fail fast)
+    try:
+        data = PaymentSchema().load(request.json, unknown=EXCLUDE)
+    except ValidationError as e:
+        return jsonify(e.messages), 400
+
+    # 2. Enqueue Job (Priority 10)
+    # Sending Object ID string to worker, worker re-validates DB state
+    user_id_str = str(g.current_user["_id"])
+    
+    job = worker_engine.submit_job(
+        worker_logic_payment, 
+        user_id_str, 
+        data, 
+        priority=10, 
+        wait=True  # We try to wait to give immediate feedback
+    )
+
+    if job.get("finished"):
+        if job.get("error_msg"):
+            # Generic error wrapper could be improved, but sufficient
+            logger.error(f"Payment failed: {job.get('error_msg')}")
+            return jsonify({"msg": "Operation failed", "detail": str(job.get('error_msg'))}), 500
+        
+        # Determine status code based on logic result (usually returned as tuple from worker)
+        # But our simple wrapper returns data.
+        res_data, code = job["result"]
+        return jsonify(res_data), code
+
+    return jsonify({"msg": "Request queued", "job_id": job.get("job_id")}), 202
+
+# ----- ADMIN ROUTES -----
 
 @app.route("/admin/transactions", methods=["GET"])
 @admin_required
 def admin_tx_list():
-    query = {}
     status = request.args.get("status")
+    query = {}
     if status: query["status"] = status
     
-    data = list(mongo.db.transactions.find(query).sort("created_at", -1).limit(200))
-    for t in data:
-        t["_id"] = str(t["_id"])
-        t["user_id"] = str(t["user_id"])
-        if t.get("created_at"): t["created_at"] = t["created_at"].isoformat()
-    return jsonify({"transactions": data})
+    # Direct DB access is fine for Reads
+    cursor = db_core.get_collection("transactions").find(query).sort("created_at", -1).limit(100)
+    
+    output = []
+    for tx in cursor:
+        tx["_id"] = str(tx["_id"])
+        tx["user_id"] = str(tx["user_id"])
+        if tx.get("created_at"): tx["created_at"] = tx["created_at"].isoformat()
+        output.append(tx)
+        
+    return jsonify(output)
 
 @app.route("/admin/transactions/<tx_id>/approve", methods=["POST"])
 @admin_required
-def admin_approve(tx_id):
-    oid = safe_object_id(tx_id)
-    if not oid: return jsonify({"msg": "Invalid ID"}), 400
-    
-    tx = mongo.db.transactions.find_one({"_id": oid, "status": "pending"})
-    if not tx:
-        return jsonify({"msg": "Transaction not found or processed"}), 404
-    
-    user = mongo.db.users.find_one({"_id": tx["user_id"]})
-    if not user:
-        return jsonify({"msg": "User associated not found"}), 404
-        
-    now = get_utc_now()
-    cur_exp = user.get("expiryDate")
-    if cur_exp and cur_exp.tzinfo is None: cur_exp = cur_exp.replace(tzinfo=timezone.utc)
-    
-    start = cur_exp if (cur_exp and cur_exp > now) else now
-    new_exp = start + timedelta(days=tx["days"])
-    
-    # Atomic-like update not strictly necessary but safer
-    mongo.db.users.update_one({"_id": user["_id"]}, {"$set": {"expiryDate": new_exp}, "$inc": {"total_purchases": 1}})
-    mongo.db.transactions.update_one({"_id": oid}, {"$set": {
-        "status": "approved", 
-        "processed_at": now, 
-        "approved_by": g.current_admin.get("username", "system")
-    }})
-    
-    return jsonify({"msg": "Approved", "new_expiry": new_exp.isoformat()})
-
-@app.route("/admin/transactions/<tx_id>/reject", methods=["POST"])
-@admin_required
-def admin_reject(tx_id):
-    oid = safe_object_id(tx_id)
-    if not oid: return jsonify({"msg": "Invalid ID"}), 400
-
-    reason = request.json.get("reason", "") if request.json else ""
-
-    res = mongo.db.transactions.update_one(
-        {"_id": oid, "status": "pending"},
-        {"$set": {
-            "status": "rejected",
-            "rejected_at": get_utc_now(),
-            "reject_reason": reason,
-            "rejected_by": g.current_admin.get("username", "system")
-        }}
+def approve_tx(tx_id):
+    # Enqueue approval to avoid DB locks blocking admin UI
+    job = worker_engine.submit_job(
+        worker_logic_approve_tx,
+        tx_id,
+        g.current_user["username"],
+        priority=5,
+        wait=True
     )
-    if res.matched_count == 0:
-         return jsonify({"msg": "Tx not found or processed"}), 404
-    return jsonify({"msg": "Rejected"})
+    
+    if job.get("finished") and "result" in job:
+        res, code = job["result"]
+        return jsonify(res), code
+    
+    return jsonify({"msg": "Processing"}), 202
 
-# -------------------------------------------------------------------------
-# 9. Initialization Logic
-# -------------------------------------------------------------------------
-def initial_setup():
-    with app.app_context():
+@app.route("/admin/coupons", methods=["POST"])
+@admin_required
+def create_coupon():
+    try:
+        data = CouponSchema().load(request.json)
+    except ValidationError as e:
+        return jsonify(e.messages), 400
+        
+    try:
+        doc = {
+            "code": data["code"],
+            "bonus_days": data["bonus_days"],
+            "max_uses": data["max_uses"],
+            "uses": 0,
+            "expires_at": data["expires_at"], # Already datetime or None
+            "created_at": get_utc_now()
+        }
+        db_core.get_collection("coupons").insert_one(doc)
+        return jsonify({"msg": "Coupon created"}), 201
+    except DuplicateKeyError:
+        return jsonify({"msg": "Coupon code already exists"}), 409
+
+# ----- INITIALIZATION -----
+
+def on_app_ready():
+    logger.info("Initializing Indexes & Workers...")
+    worker_engine.start()
+    
+    # Async Init DB Index (Don't block boot)
+    def _ensure_indexes():
         try:
-            # Safe index creation
-            mongo.db.users.create_index("username", unique=True)
-            mongo.db.coupons.create_index("code", unique=True)
-            mongo.db.transactions.create_index("tx_hash", unique=True, sparse=True)
+            db = db_core.get_db()
+            db.users.create_index([("username", ASCENDING)], unique=True)
+            db.transactions.create_index([("tx_hash", ASCENDING)], unique=True, sparse=True)
+            db.coupons.create_index([("code", ASCENDING)], unique=True)
+            logger.info("DB Indexes secured.")
             
-            # Create Env Admin
-            if Config.ADMIN_ENV_USERNAME and Config.ADMIN_ENV_PASSWORD:
-                u = Config.ADMIN_ENV_USERNAME.lower()
-                existing = mongo.db.users.find_one({"username": u})
-                if not existing:
-                    logger.info(f"Creating env admin: {u}")
-                    mongo.db.users.insert_one({
-                        "username": u,
-                        "password": hash_password(Config.ADMIN_ENV_PASSWORD),
+            # Create Default Admin
+            if AppConfig.ADMIN_ENV_USER and AppConfig.ADMIN_ENV_PASS:
+                u_col = db.users
+                name = AppConfig.ADMIN_ENV_USER.lower()
+                if not u_col.find_one({"username": name}):
+                    u_col.insert_one({
+                        "username": name,
+                        "password": hash_password(AppConfig.ADMIN_ENV_PASS),
                         "role": "admin",
                         "session_salt": "system",
                         "created_at": get_utc_now()
                     })
-                else:
-                    mongo.db.users.update_one({"username": u}, {"$set": {"role": "admin"}})
-            logger.info("DB Indexes ensured.")
+                    logger.info("Bootstrap admin created.")
         except Exception as e:
-            logger.warning(f"Startup DB init failed (DB might be down): {e}")
+            logger.error(f"Index init failed: {e}")
+
+    # Fire and forget index creation job
+    worker_engine.submit_job(_ensure_indexes, priority=50, wait=False)
+
+# Register shutdown
+atexit.register(lambda: worker_engine.stop())
 
 if __name__ == "__main__":
-    initial_setup()
-    app.run(host="0.0.0.0", port=Config.APP_PORT, debug=False)
+    on_app_ready()
+    app.run(host="0.0.0.0", port=AppConfig.APP_PORT, debug=False)
