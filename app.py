@@ -407,6 +407,33 @@ def worker_logic_approve_tx(tx_oid_str, admin_name):
     
     return {"msg": "Approved", "new_expiry": new_exp.isoformat()}, 200
 
+def worker_logic_reject_tx(tx_oid_str, admin_name, reason=None):
+    db = db_core.get_db()
+
+    try:
+        tx_oid = ObjectId(tx_oid_str)
+    except InvalidId:
+        return {"msg": "Invalid ID format"}, 400
+
+    tx = db.transactions.find_one({"_id": tx_oid, "status": "pending"})
+    if not tx:
+        return {"msg": "Transaction not found or not pending"}, 404
+
+    db.transactions.update_one(
+        {"_id": tx_oid},
+        {
+            "$set": {
+                "status": "rejected",
+                "rejected_by": admin_name,
+                "rejected_at": get_utc_now(),
+                "reject_reason": reason
+            }
+        }
+    )
+
+    return {"msg": "Rejected"}, 200
+
+
 # ----- ROUTES -----
 
 @app.route("/", methods=["GET"])
@@ -564,6 +591,29 @@ def approve_tx(tx_id):
         res, code = job["result"]
         return jsonify(res), code
     return jsonify({"msg": "Processing"}), 202
+
+@app.route("/admin/transactions/<tx_id>/reject", methods=["POST"])
+@admin_required
+def reject_tx(tx_id):
+
+    body = request.json or {}
+    reason = body.get("reason")
+
+    job = worker_engine.submit_job(
+        worker_logic_reject_tx,
+        tx_id,
+        g.current_user["username"],
+        reason,
+        priority=5,
+        wait=True
+    )
+
+    if job.get("finished") and "result" in job:
+        res, code = job["result"]
+        return jsonify(res), code
+
+    return jsonify({"msg": "Processing"}), 202
+
 
 @app.route("/admin/coupons", methods=["GET", "POST"])
 @admin_required
