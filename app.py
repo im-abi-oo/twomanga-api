@@ -238,9 +238,12 @@ class RegisterSchema(Schema):
             raise ValidationError("Invalid username format")
 
 class PaymentSchema(Schema):
-    # FIXED: Used built-in 'validate' parameter instead of method decorator
-    # This prevents the "unexpected keyword argument 'data_key'" crash in strict/Python 3.14 environments
-    days = fields.Int(required=True, validate=validate.Range(min=1, max=3650, error="Days must be between 1-3650"))
+    # days is now optional; business rule enforced in route
+    days = fields.Int(
+        required=False,
+        allow_none=True,
+        validate=validate.Range(min=1, max=3650, error="Days must be between 1-3650")
+    )
     
     tx_hash = fields.Str(load_default=None)
     coupon_code = fields.Str(load_default=None)
@@ -288,6 +291,19 @@ def strict_session(fn):
         return fn(*args, **kwargs)
     return wrapper
 
+# ----- COUPON CLEANUP (AUTO-DELETE EXPIRED) -----
+def cleanup_expired_coupons():
+    try:
+        db = db_core.get_db()
+        now = get_utc_now()
+        result = db.coupons.delete_many({
+            "expires_at": {"$lt": now}
+        })
+        if result.deleted_count > 0:
+            logger.info(f"Deleted {result.deleted_count} expired coupons")
+    except Exception as e:
+        logger.error(f"Coupon cleanup failed: {e}")
+
 # ----- BUSINESS LOGIC (WORKER SIDE) -----
 
 def worker_logic_payment(user_id_str, data):
@@ -313,7 +329,12 @@ def worker_logic_payment(user_id_str, data):
         
         now_utc = get_utc_now()
         exp_at = c_doc.get("expires_at")
+        # If expired: delete it immediately and return error
         if exp_at and exp_at.replace(tzinfo=datetime.timezone.utc) < now_utc:
+            try:
+                coupons.delete_one({"_id": c_doc["_id"]})
+            except Exception as e:
+                logger.warning(f"Failed to delete expired coupon {_id}: {e}")
             return {"msg": "Coupon expired"}, 400
         
         if c_doc.get("max_uses") is not None and c_doc.get("uses", 0) >= c_doc["max_uses"]:
@@ -548,12 +569,16 @@ def me():
 @app.route("/payment/submit", methods=["POST"])
 @strict_session
 def payment_submit():
-    # FIXED: Validation won't crash now due to Schema changes
+    # Validation adjusted: days optional in schema, business rule enforced below
     try:
         data = PaymentSchema().load(request.json, unknown=EXCLUDE)
     except ValidationError as e:
         logger.warning(f"Validation failed: {e.messages}")
         return jsonify(e.messages), 400
+
+    # Business rule: require either coupon_code (use coupon) OR days (purchase)
+    if not data.get("coupon_code") and not data.get("days"):
+        return jsonify({"msg": "days is required when no coupon is used"}), 400
 
     user_id_str = str(g.current_user["_id"])
     
@@ -677,12 +702,15 @@ def on_app_ready():
     logger.info("Initializing Indexes & Workers...")
     worker_engine.start()
     
+    # ensure indexes and bootstrap admin
     def _ensure_indexes():
         try:
             db = db_core.get_db()
             db.users.create_index([("username", ASCENDING)], unique=True)
             db.transactions.create_index([("tx_hash", ASCENDING)], unique=True, sparse=True)
             db.coupons.create_index([("code", ASCENDING)], unique=True)
+            # optional index to speed expiry cleanup queries
+            db.coupons.create_index([("expires_at", ASCENDING)])
             logger.info("DB Indexes secured.")
             
             if AppConfig.ADMIN_ENV_USER and AppConfig.ADMIN_ENV_PASS:
@@ -701,6 +729,9 @@ def on_app_ready():
             logger.error(f"Index init failed: {e}")
 
     worker_engine.submit_job(_ensure_indexes, priority=50, wait=False)
+
+    # schedule cleanup of expired coupons on startup (non-blocking)
+    worker_engine.submit_job(cleanup_expired_coupons, priority=40, wait=False)
 
 atexit.register(lambda: worker_engine.stop())
 
