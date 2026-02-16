@@ -474,7 +474,26 @@ def register():
         "total_purchases": 0
     }
     coll.insert_one(doc)
-    return jsonify({"msg": "Registered"}), 201
+
+# Auto login after register
+salt = doc["session_salt"]
+
+access = create_access_token(
+    identity=username,
+    additional_claims={"session_salt": salt}
+)
+
+refresh = create_refresh_token(
+    identity=username,
+    additional_claims={"session_salt": salt}
+)
+
+return jsonify({
+    "msg": "Registered",
+    "access_token": access,
+    "refresh_token": refresh
+}), 201
+
 
 @app.route("/auth/login", methods=["POST"])
 def login():
