@@ -3,8 +3,6 @@ package main
 import (
 	"container/heap"
 	"context"
-	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
