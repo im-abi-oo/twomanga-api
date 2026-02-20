@@ -3,7 +3,7 @@ package main
 import (
 	"container/heap"
 	"context"
-	"errors"
+	"fmt" // اضافه شده برای مدیریت ارورها
 	"log"
 	"net/http"
 	"os"
@@ -43,19 +43,18 @@ var cfg Config
 var mongoClient *mongo.Client
 var db *mongo.Database
 
-func loadConfig() error {
-	_ = godotenv.Load()
+func loadConfig() {
+	_ = godotenv.Load() // نادیده گرفتن ارور برای محیط‌هایی که فایل .env ندارند
 
 	cfg.MongoURI = os.Getenv("MONGO_URI")
 	if cfg.MongoURI == "" {
-		return errors.New("MONGO_URI is required")
+		log.Println("WARNING: MONGO_URI is missing")
 	}
-
-	secret := os.Getenv("JWT_SECRET_KEY")
-	if secret == "" {
-		return errors.New("JWT_SECRET_KEY is required")
+	cfg.JWTSecret = []byte(os.Getenv("JWT_SECRET_KEY"))
+	if len(cfg.JWTSecret) == 0 {
+		log.Println("WARNING: JWT_SECRET_KEY is missing, generic fallback used (NOT SAFE FOR PROD)")
+		cfg.JWTSecret = []byte("default-insecure-secret")
 	}
-	cfg.JWTSecret = []byte(secret)
 
 	cfg.DBName = os.Getenv("MONGO_DBNAME")
 	if cfg.DBName == "" {
@@ -67,19 +66,20 @@ func loadConfig() error {
 		cfg.Port = "5001"
 	}
 
-	wc, err := strconv.Atoi(os.Getenv("WORKER_COUNT"))
-	if err != nil || wc <= 0 {
+	wc, _ := strconv.Atoi(os.Getenv("WORKER_COUNT"))
+	if wc <= 0 {
 		wc = 4
 	}
 	cfg.WorkerCount = wc
 
-	ws, err := strconv.ParseFloat(os.Getenv("JOB_WAIT_SECONDS"), 64)
-	if err != nil || ws <= 0 {
+	ws, _ := strconv.ParseFloat(os.Getenv("JOB_WAIT_SECONDS"), 64)
+	if ws == 0 {
 		ws = 8.0
 	}
 	cfg.JobWaitSeconds = time.Duration(ws * float64(time.Second))
 
 	admins := os.Getenv("ADMIN_USERNAMES")
+	cfg.AdminUsernames = []string{}
 	for _, u := range strings.Split(admins, ",") {
 		if t := strings.TrimSpace(u); t != "" {
 			cfg.AdminUsernames = append(cfg.AdminUsernames, strings.ToLower(t))
@@ -87,39 +87,33 @@ func loadConfig() error {
 	}
 	cfg.AdminEnvUser = strings.ToLower(os.Getenv("ADMIN_USERNAME"))
 	cfg.AdminEnvPass = os.Getenv("ADMIN_PASSWORD")
-
-	return nil
 }
 
 // ----- DATABASE -----
 
-func connectDB(ctx context.Context) error {
+func connectDB() {
+	// افزایش تایم‌اوت اتصال برای سرورهای کند
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
 	if cfg.MongoURI == "" {
-		return errors.New("mongo uri empty")
+		log.Fatal("Fatal: MongoURI is empty. Cannot connect to database.")
 	}
 
 	clientOptions := options.Client().ApplyURI(cfg.MongoURI)
 	client, err := mongo.Connect(ctx, clientOptions)
 	if err != nil {
-		return err
+		log.Fatalf("Failed to create Mongo client: %v", err)
 	}
 
-	if err := client.Ping(ctx, nil); err != nil {
-		_ = client.Disconnect(ctx)
-		return err
+	err = client.Ping(ctx, nil)
+	if err != nil {
+		log.Fatalf("MongoDB Ping Failed (Check network/credentials): %v", err)
 	}
 
 	mongoClient = client
 	db = client.Database(cfg.DBName)
 	log.Printf("Connected to MongoDB: %s", cfg.DBName)
-	return nil
-}
-
-func getDB() (*mongo.Database, error) {
-	if db == nil {
-		return nil, errors.New("database not initialized")
-	}
-	return db, nil
 }
 
 // ----- MODELS -----
@@ -173,7 +167,7 @@ func checkPassword(password, hash string) bool {
 	return err == nil
 }
 
-// ----- WORKER ENGINE (Priority Queue) -----
+// ----- WORKER ENGINE (Safety Refactor) -----
 
 type JobResult struct {
 	Data interface{}
@@ -212,8 +206,19 @@ var (
 	queueLock  sync.Mutex
 	jobSignal  = make(chan struct{}, 1000)
 	shutdownCh = make(chan struct{})
-	wg         sync.WaitGroup
 )
+
+// safeExecWrap executes the task with panic recovery
+func safeExecWrap(task func() (interface{}, int, error)) (data interface{}, code int, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("PANIC in worker: %v", r)
+			code = 500
+			log.Printf("[CRITICAL] Worker Panic: %v", r)
+		}
+	}()
+	return task()
+}
 
 func SubmitJob(priority int, task func() (interface{}, int, error), wait bool) (interface{}, int, error) {
 	resChan := make(chan JobResult, 1)
@@ -231,37 +236,29 @@ func SubmitJob(priority int, task func() (interface{}, int, error), wait bool) (
 	select {
 	case jobSignal <- struct{}{}:
 	default:
+		// Signal buffer full, worker will catch up
 	}
 
 	if !wait {
 		return map[string]interface{}{"queued": true, "job_id": job.Sequence}, 202, nil
 	}
 
+	// Wait with timeout
 	select {
 	case res := <-resChan:
 		return res.Data, res.Code, res.Err
 	case <-time.After(cfg.JobWaitSeconds):
-		return map[string]string{"msg": "Processing queued due to load"}, 202, nil
-	case <-shutdownCh:
-		return map[string]string{"msg": "Server shutting down"}, 503, nil
+		return map[string]string{"msg": "Processing queued due to load (timeout)"}, 202, nil
 	}
 }
 
 func startWorkers(count int) {
 	for i := 0; i < count; i++ {
-		wg.Add(1)
 		go func(id int) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("Worker-%d recovered from panic: %v", id, r)
-				}
-			}()
 			log.Printf("Worker-%d started", id)
 			for {
 				select {
 				case <-shutdownCh:
-					log.Printf("Worker-%d stopping (shutdown)", id)
 					return
 				case <-jobSignal:
 					queueLock.Lock()
@@ -269,92 +266,95 @@ func startWorkers(count int) {
 						queueLock.Unlock()
 						continue
 					}
-					item := heap.Pop(&jobQueue).(*Job)
+					// Double check nil or heap issues (safe with standard library but good to be sure)
+					rawItem := heap.Pop(&jobQueue)
 					queueLock.Unlock()
 
-					func(j *Job) {
-						defer func() {
-							if r := recover(); r != nil {
-								log.Printf("Worker-%d task panic recovered: %v", id, r)
-								select {
-								case j.ResultChan <- JobResult{Data: map[string]string{"msg": "Internal panic"}, Err: errors.New("task panic"), Code: 500}:
-								default:
-								}
-							}
-							close(j.ResultChan)
-						}()
+					if rawItem == nil {
+						continue
+					}
+					item := rawItem.(*Job)
 
-						data, code, err := j.Func()
-						if err != nil && data == nil {
-							data = map[string]string{"msg": "Internal Error", "detail": err.Error()}
-							if code == 0 {
-								code = 500
-							}
+					// Execute safely (Recovery logic applied here)
+					data, code, err := safeExecWrap(item.Func)
+
+					if err != nil && data == nil {
+						data = map[string]string{"msg": "Processing Error", "detail": err.Error()}
+						if code == 0 {
+							code = 500
 						}
-						select {
-						case j.ResultChan <- JobResult{Data: data, Code: code, Err: err}:
-						default:
-						}
-					}(item)
+					}
+					
+					// Avoid blocking if receiver abandoned channel
+					select {
+					case item.ResultChan <- JobResult{Data: data, Code: code, Err: err}:
+					default:
+					}
+					close(item.ResultChan)
 				}
 			}
 		}(i)
 	}
 }
 
-// ----- BUSINESS LOGIC (Worker Side) -----
+// ----- BUSINESS LOGIC -----
 
 func logicApplyPayment(userIDStr string, couponCode, txHash string, daysReq int) (interface{}, int, error) {
-	database, err := getDB()
-	if err != nil {
-		return nil, 500, err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// استفاده از Context مجزا برای عملیات DB که طولانی می‌شود
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	userOID, err := primitive.ObjectIDFromHex(userIDStr)
 	if err != nil {
-		return map[string]string{"msg": "Invalid user id"}, 400, nil
+		return map[string]string{"msg": "Invalid user ID"}, 400, nil
+	}
+
+	// بررسی وجود db
+	if db == nil {
+		return nil, 500, fmt.Errorf("Database connection lost")
 	}
 
 	var user User
-	if err := database.Collection("users").FindOne(ctx, bson.M{"_id": userOID}).Decode(&user); err != nil {
-		if err == mongo.ErrNoDocuments {
-			return map[string]string{"msg": "User not found"}, 404, nil
-		}
-		return nil, 500, err
+	err = db.Collection("users").FindOne(ctx, bson.M{"_id": userOID}).Decode(&user)
+	if err != nil {
+		return map[string]string{"msg": "User not found"}, 404, err
 	}
 
 	if couponCode != "" {
-		couponColl := database.Collection("coupons")
+		couponColl := db.Collection("coupons")
 		var cp Coupon
+
 		err := couponColl.FindOne(ctx, bson.M{"code": couponCode}).Decode(&cp)
 		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				return map[string]string{"msg": "Invalid coupon code"}, 400, nil
-			}
-			return nil, 500, err
+			return map[string]string{"msg": "Invalid coupon code"}, 400, nil
 		}
 
 		now := time.Now().UTC()
 		if cp.ExpiresAt != nil && cp.ExpiresAt.Before(now) {
-			_, _ = couponColl.DeleteOne(ctx, bson.M{"_id": cp.ID})
+			// کوپن منقضی شده
+			couponColl.DeleteOne(ctx, bson.M{"_id": cp.ID})
 			return map[string]string{"msg": "Coupon expired"}, 400, nil
 		}
 		if cp.MaxUses != nil && cp.Uses >= *cp.MaxUses {
-			_, _ = couponColl.DeleteOne(ctx, bson.M{"_id": cp.ID})
+			couponColl.DeleteOne(ctx, bson.M{"_id": cp.ID})
 			return map[string]string{"msg": "Coupon limits reached"}, 400, nil
 		}
+		
+		// اطمینان از مقداردهی شدن UsedBy برای جلوگیری از پنیک در حلقه
+		if cp.UsedBy == nil {
+			cp.UsedBy = []primitive.ObjectID{}
+		}
+
 		for _, uID := range cp.UsedBy {
 			if uID == userOID {
 				return map[string]string{"msg": "You have already used this coupon"}, 400, nil
 			}
 		}
 
+		// Optimistic locking
 		filter := bson.M{
 			"_id":     cp.ID,
-			"uses":    cp.Uses,
+			"uses":    cp.Uses, 
 			"used_by": bson.M{"$ne": userOID},
 		}
 		update := bson.M{
@@ -365,49 +365,48 @@ func logicApplyPayment(userIDStr string, couponCode, txHash string, daysReq int)
 		var updatedCp Coupon
 		err = couponColl.FindOneAndUpdate(ctx, filter, update, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&updatedCp)
 		if err != nil {
-			return map[string]string{"msg": "Coupon invalid, expired, already used, or limit reached"}, 400, nil
+			return map[string]string{"msg": "Coupon unavailable or usage conflict"}, 409, nil
 		}
 
 		startPoint := now
 		if user.ExpiryDate != nil && user.ExpiryDate.After(now) {
 			startPoint = *user.ExpiryDate
 		}
-		newExpiry := startPoint.Add(time.Duration(updatedCp.BonusDays) * 24 * time.Hour)
+		newExpiry := startPoint.Add(time.Duration(cp.BonusDays) * 24 * time.Hour)
 
-		_, err = database.Collection("users").UpdateOne(ctx, bson.M{"_id": userOID}, bson.M{
+		_, err = db.Collection("users").UpdateOne(ctx, bson.M{"_id": userOID}, bson.M{
 			"$set": bson.M{"expiryDate": newExpiry},
 			"$inc": bson.M{"total_purchases": 1},
 		})
 
+		// Simple Rollback attempt if User update fails
 		if err != nil {
-			log.Printf("[ROLLBACK] Coupon %s for user %s failed. Rolling back. err=%v", updatedCp.Code, userIDStr, err)
-			_, _ = couponColl.UpdateOne(context.Background(), bson.M{"_id": updatedCp.ID}, bson.M{
+			couponColl.UpdateOne(context.Background(), bson.M{"_id": cp.ID}, bson.M{
 				"$inc":  bson.M{"uses": -1},
 				"$pull": bson.M{"used_by": userOID},
 			})
-			return map[string]string{"msg": "Failed to apply coupon, please retry"}, 500, err
+			return map[string]string{"msg": "Failed to apply bonus"}, 500, err
 		}
 
 		if updatedCp.MaxUses != nil && updatedCp.Uses >= *updatedCp.MaxUses {
-			_, _ = couponColl.DeleteOne(context.Background(), bson.M{"_id": updatedCp.ID})
+			// Clean cleanup later instead of delete immediate can be safer, but logic maintained:
+			couponColl.DeleteOne(context.Background(), bson.M{"_id": updatedCp.ID})
 		}
 
 		return map[string]interface{}{
-			"msg":        "Coupon applied successfully",
+			"msg":        "Coupon applied",
 			"new_expiry": newExpiry.Format(time.RFC3339),
 		}, 200, nil
 	}
 
 	if txHash == "" {
-		return map[string]string{"msg": "TX Hash required if no coupon"}, 400, nil
+		return map[string]string{"msg": "TX Hash required"}, 400, nil
 	}
 
-	count, err := database.Collection("transactions").CountDocuments(ctx, bson.M{"tx_hash": txHash})
-	if err != nil {
-		return nil, 500, err
-	}
+	// Check duplicates
+	count, _ := db.Collection("transactions").CountDocuments(ctx, bson.M{"tx_hash": txHash})
 	if count > 0 {
-		return map[string]string{"msg": "Transaction already submitted"}, 409, nil
+		return map[string]string{"msg": "Transaction exists"}, 409, nil
 	}
 
 	newTx := Transaction{
@@ -419,17 +418,18 @@ func logicApplyPayment(userIDStr string, couponCode, txHash string, daysReq int)
 		CreatedAt: time.Now().UTC(),
 	}
 
-	res, err := database.Collection("transactions").InsertOne(ctx, newTx)
+	res, err := db.Collection("transactions").InsertOne(ctx, newTx)
 	if err != nil {
-		if mongo.IsDuplicateKeyError(err) {
-			return map[string]string{"msg": "Transaction already submitted"}, 409, nil
-		}
 		return nil, 500, err
 	}
 
-	idStr := res.InsertedID.(primitive.ObjectID).Hex()
+	idStr := "unknown"
+	if oid, ok := res.InsertedID.(primitive.ObjectID); ok {
+		idStr = oid.Hex()
+	}
+
 	return map[string]interface{}{
-		"msg":   "Transaction pending approval",
+		"msg":   "Pending approval",
 		"tx_id": idStr,
 	}, 201, nil
 }
@@ -442,10 +442,6 @@ type CustomClaims struct {
 }
 
 func generateTokens(username, salt string) (string, string, error) {
-	if len(cfg.JWTSecret) == 0 {
-		return "", "", errors.New("jwt secret not configured")
-	}
-
 	accClaims := CustomClaims{
 		SessionSalt: salt,
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -473,20 +469,18 @@ func generateTokens(username, salt string) (string, string, error) {
 
 func AuthMiddleware(requiredAdmin bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		_, derr := getDB()
-		if derr != nil {
-			c.AbortWithStatusJSON(500, gin.H{"msg": "Service unavailable"})
-			return
-		}
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-			c.AbortWithStatusJSON(401, gin.H{"msg": "Missing or Invalid Token"})
+			c.AbortWithStatusJSON(401, gin.H{"msg": "Missing Token"})
 			return
 		}
 
 		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 		claims := &CustomClaims{}
 		token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method")
+			}
 			return cfg.JWTSecret, nil
 		})
 
@@ -496,29 +490,22 @@ func AuthMiddleware(requiredAdmin bool) gin.HandlerFunc {
 		}
 
 		username := claims.Subject
-
-		database, err := getDB()
-		if err != nil {
-			c.AbortWithStatusJSON(500, gin.H{"msg": "Service unavailable"})
-			return
-		}
+		// Context for strict check
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
 		var user User
-		if err := database.Collection("users").FindOne(context.Background(), bson.M{"username": username}).Decode(&user); err != nil {
-			c.AbortWithStatusJSON(401, gin.H{"msg": "Session expired or overridden"})
-			return
-		}
+		err = db.Collection("users").FindOne(ctx, bson.M{"username": username}).Decode(&user)
 
-		if user.SessionSalt != claims.SessionSalt {
-			c.AbortWithStatusJSON(401, gin.H{"msg": "Session expired or overridden"})
+		if err != nil || user.SessionSalt != claims.SessionSalt {
+			c.AbortWithStatusJSON(401, gin.H{"msg": "Session Expired"})
 			return
 		}
 
 		isAdmin := user.Role == "admin"
 		for _, adm := range cfg.AdminUsernames {
 			if adm == username {
-				isAdmin = true
-				break
+				isAdmin = true; break
 			}
 		}
 		if cfg.AdminEnvUser != "" && username == cfg.AdminEnvUser {
@@ -526,10 +513,11 @@ func AuthMiddleware(requiredAdmin bool) gin.HandlerFunc {
 		}
 
 		if requiredAdmin && !isAdmin {
-			c.AbortWithStatusJSON(403, gin.H{"msg": "Admin access required"})
+			c.AbortWithStatusJSON(403, gin.H{"msg": "Forbidden"})
 			return
 		}
 
+		// Save User Value (NOT POINTER) to Context
 		c.Set("user", user)
 		c.Next()
 	}
@@ -538,29 +526,26 @@ func AuthMiddleware(requiredAdmin bool) gin.HandlerFunc {
 // ----- HANDLERS -----
 
 func register(c *gin.Context) {
-	database, derr := getDB()
-	if derr != nil {
-		c.JSON(500, gin.H{"msg": "Service unavailable"})
-		return
-	}
-
 	var body struct {
 		Username string `json:"username" binding:"required"`
 		Password string `json:"password" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"username": []string{"Missing data"}})
+		c.JSON(400, gin.H{"msg": "Missing fields"})
 		return
 	}
 
 	username := strings.ToLower(strings.TrimSpace(body.Username))
-	if len(username) < 3 || strings.Contains(username, " ") {
-		c.JSON(400, gin.H{"username": []string{"Invalid username format"}})
+	if len(username) < 3 {
+		c.JSON(400, gin.H{"msg": "Username too short"})
 		return
 	}
 
-	var exists User
-	if err := database.Collection("users").FindOne(c, bson.M{"username": username}).Decode(&exists); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	count, _ := db.Collection("users").CountDocuments(ctx, bson.M{"username": username})
+	if count > 0 {
 		c.JSON(409, gin.H{"msg": "Username exists"})
 		return
 	}
@@ -570,13 +555,9 @@ func register(c *gin.Context) {
 
 	role := "user"
 	for _, adm := range cfg.AdminUsernames {
-		if adm == username {
-			role = "admin"
-		}
+		if adm == username { role = "admin" }
 	}
-	if cfg.AdminEnvUser == username {
-		role = "admin"
-	}
+	if cfg.AdminEnvUser == username { role = "admin" }
 
 	newUser := User{
 		Username:    username,
@@ -586,28 +567,17 @@ func register(c *gin.Context) {
 		CreatedAt:   time.Now().UTC(),
 	}
 
-	res, err := database.Collection("users").InsertOne(c, newUser)
+	_, err := db.Collection("users").InsertOne(ctx, newUser)
 	if err != nil {
-		if mongo.IsDuplicateKeyError(err) {
-			c.JSON(409, gin.H{"msg": "Username exists"})
-			return
-		}
-		c.JSON(500, gin.H{"msg": "DB Error"})
+		c.JSON(500, gin.H{"msg": "Registration failed"})
 		return
 	}
-	newUser.ID = res.InsertedID.(primitive.ObjectID)
 
 	at, rt, _ := generateTokens(username, salt)
 	c.JSON(201, gin.H{"msg": "Registered", "access_token": at, "refresh_token": rt})
 }
 
 func login(c *gin.Context) {
-	database, derr := getDB()
-	if derr != nil {
-		c.JSON(500, gin.H{"msg": "Service unavailable"})
-		return
-	}
-
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -615,114 +585,119 @@ func login(c *gin.Context) {
 	c.ShouldBindJSON(&body)
 	username := strings.ToLower(strings.TrimSpace(body.Username))
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	var user User
-	err := database.Collection("users").FindOne(c, bson.M{"username": username}).Decode(&user)
+	err := db.Collection("users").FindOne(ctx, bson.M{"username": username}).Decode(&user)
 	if err != nil || !checkPassword(body.Password, user.Password) {
 		c.JSON(401, gin.H{"msg": "Invalid credentials"})
 		return
 	}
 
 	newSalt := strconv.FormatInt(time.Now().UnixNano(), 10)
-	_, _ = database.Collection("users").UpdateOne(c, bson.M{"_id": user.ID}, bson.M{"$set": bson.M{"session_salt": newSalt}})
+	// Ignore update error, session will just persist old salt briefly
+	db.Collection("users").UpdateOne(ctx, bson.M{"_id": user.ID}, bson.M{"$set": bson.M{"session_salt": newSalt}})
 
 	at, rt, _ := generateTokens(username, newSalt)
 	c.JSON(200, gin.H{"access_token": at, "refresh_token": rt})
 }
 
 func getMe(c *gin.Context) {
-	database, derr := getDB()
-	if derr != nil {
-		c.JSON(500, gin.H{"msg": "Service unavailable"})
+	// SAFE CASTING
+	uVal, exists := c.Get("user")
+	if !exists {
+		c.JSON(401, gin.H{"msg": "Unauthorized context"})
+		return
+	}
+	
+	// Create safe copy for closure
+	currentUser, ok := uVal.(User)
+	if !ok {
+		c.JSON(500, gin.H{"msg": "User context corrupted"})
 		return
 	}
 
-	u, _ := c.Get("user")
-	currentUser := u.(User)
-
 	task := func() (interface{}, int, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
 		var user User
-		if err := database.Collection("users").FindOne(context.Background(), bson.M{"_id": currentUser.ID}).Decode(&user); err != nil {
-			return nil, 500, err
+		// Refresh from DB
+		err := db.Collection("users").FindOne(ctx, bson.M{"_id": currentUser.ID}).Decode(&user)
+		if err != nil {
+			return nil, 404, err
 		}
 
 		now := time.Now().UTC()
 		daysLeft := 0
-		expIso := ""
+		var expIso interface{} = nil
 
 		if user.ExpiryDate != nil {
-			expIso = user.ExpiryDate.Format(time.RFC3339)
+			iso := user.ExpiryDate.Format(time.RFC3339)
+			expIso = iso
 			if user.ExpiryDate.After(now) {
 				daysLeft = int(user.ExpiryDate.Sub(now).Hours() / 24)
 			}
 		}
 
-		resp := gin.H{
-			"username":  user.Username,
-			"role":      user.Role,
-			"days_left": daysLeft,
-		}
-		if user.ExpiryDate != nil {
-			resp["expiry_iso"] = expIso
-		} else {
-			resp["expiry_iso"] = nil
-		}
-		return resp, 200, nil
+		return gin.H{
+			"username":   user.Username,
+			"role":       user.Role,
+			"days_left":  daysLeft,
+			"expiry_iso": expIso,
+		}, 200, nil
 	}
 
 	res, code, err := SubmitJob(0, task, true)
 	if err != nil {
-		c.JSON(code, gin.H{"msg": "System error"})
+		c.JSON(code, gin.H{"msg": "Error", "detail": err.Error()})
 		return
 	}
 	c.JSON(code, res)
 }
 
 func submitPayment(c *gin.Context) {
-	database, derr := getDB()
-	if derr != nil {
-		c.JSON(500, gin.H{"msg": "Service unavailable"})
+	uVal, exists := c.Get("user")
+	if !exists {
+		c.JSON(401, gin.H{"msg": "Unauthorized"})
 		return
 	}
-
-	u, _ := c.Get("user")
-	currentUser := u.(User)
+	currentUser := uVal.(User)
 
 	var body struct {
 		Days       *int   `json:"days"`
 		TxHash     string `json:"tx_hash"`
 		CouponCode string `json:"coupon_code"`
 	}
+	
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"msg": "Validation failed"})
+		c.JSON(400, gin.H{"msg": "Invalid JSON"})
 		return
 	}
 
-	if body.CouponCode == "" && body.Days == nil {
-		c.JSON(400, gin.H{"msg": "days is required when no coupon is used"})
-		return
-	}
-
+	// Logic inputs
 	days := 0
-	if body.Days != nil {
-		days = *body.Days
-	}
-
+	if body.Days != nil { days = *body.Days }
+	
 	if body.CouponCode == "" && (days < 1 || days > 3650) {
-		c.JSON(400, gin.H{"msg": "Days must be between 1-3650"})
+		c.JSON(400, gin.H{"msg": "Days required (1-3650) if no coupon"})
 		return
 	}
 
+	// Wrap in worker task
 	task := func() (interface{}, int, error) {
 		return logicApplyPayment(currentUser.ID.Hex(), body.CouponCode, body.TxHash, days)
 	}
 
 	res, code, err := SubmitJob(10, task, true)
 	if err != nil {
+		// Try to forward structured error map if available
 		if resMap, ok := res.(map[string]string); ok {
 			c.JSON(code, resMap)
 			return
 		}
-		c.JSON(code, gin.H{"msg": "Operation failed", "detail": err.Error()})
+		c.JSON(code, gin.H{"msg": "System failure", "error": err.Error()})
 		return
 	}
 	c.JSON(code, res)
@@ -731,33 +706,34 @@ func submitPayment(c *gin.Context) {
 // ----- ADMIN HANDLERS -----
 
 func adminListTx(c *gin.Context) {
-	database, derr := getDB()
-	if derr != nil {
-		c.JSON(500, gin.H{"msg": "Service unavailable"})
-		return
-	}
-
 	status := c.Query("status")
 	filter := bson.M{}
 	if status != "" {
 		filter["status"] = status
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	opts := options.Find().SetSort(bson.M{"created_at": -1}).SetLimit(100)
-	cursor, err := database.Collection("transactions").Find(context.Background(), filter, opts)
+	cursor, err := db.Collection("transactions").Find(ctx, filter, opts)
 	if err != nil {
 		c.JSON(500, gin.H{"msg": "DB error"})
 		return
 	}
-	defer cursor.Close(context.Background())
+	// Do NOT Close cursor manually, All() handles it, but deferring close is safe practice
+	defer cursor.Close(ctx)
 
 	var rawResults []Transaction
-	if err := cursor.All(context.Background(), &rawResults); err != nil {
-		c.JSON(500, gin.H{"msg": "DB error"})
+	if err := cursor.All(ctx, &rawResults); err != nil {
+		c.JSON(500, gin.H{"msg": "Cursor read error"})
 		return
 	}
 
 	output := []gin.H{}
+	// Make sure slice is not nil for safety
+	if rawResults == nil { rawResults = []Transaction{} }
+
 	for _, tx := range rawResults {
 		item := gin.H{
 			"_id":        tx.ID.Hex(),
@@ -768,6 +744,7 @@ func adminListTx(c *gin.Context) {
 			"status":     tx.Status,
 			"created_at": tx.CreatedAt.Format(time.RFC3339),
 		}
+		// Safely handle pointers
 		if tx.ProcessedAt != nil {
 			item["processed_at"] = tx.ProcessedAt.Format(time.RFC3339)
 		}
@@ -783,30 +760,29 @@ func adminListTx(c *gin.Context) {
 }
 
 func adminApproveTx(c *gin.Context) {
-	database, derr := getDB()
-	if derr != nil {
-		c.JSON(500, gin.H{"msg": "Service unavailable"})
-		return
+	txID := c.Param("tx_id")
+	uVal, _ := c.Get("user") // Safe from MustGet in case of rare middleware slip
+	admin, ok := uVal.(User)
+	if !ok {
+		c.JSON(401, gin.H{"msg": "Auth Error"})
+		return 
 	}
 
-	txID := c.Param("tx_id")
-	admin := c.MustGet("user").(User)
-
 	task := func() (interface{}, int, error) {
-		ctx := context.Background()
+		ctx := context.Background() // Worker uses bg or specific timeout
 		oid, err := primitive.ObjectIDFromHex(txID)
 		if err != nil {
-			return map[string]string{"msg": "Invalid ID format"}, 400, nil
+			return map[string]string{"msg": "Invalid ID"}, 400, nil
 		}
 
 		var tx Transaction
-		if err := database.Collection("transactions").FindOne(ctx, bson.M{"_id": oid, "status": "pending"}).Decode(&tx); err != nil {
-			return map[string]string{"msg": "Transaction not found or not pending"}, 404, nil
+		if err := db.Collection("transactions").FindOne(ctx, bson.M{"_id": oid, "status": "pending"}).Decode(&tx); err != nil {
+			return map[string]string{"msg": "TX not pending"}, 404, nil
 		}
 
 		var targetUser User
-		if err := database.Collection("users").FindOne(ctx, bson.M{"_id": tx.UserID}).Decode(&targetUser); err != nil {
-			return map[string]string{"msg": "Linked user missing"}, 404, nil
+		if err := db.Collection("users").FindOne(ctx, bson.M{"_id": tx.UserID}).Decode(&targetUser); err != nil {
+			return map[string]string{"msg": "User missing"}, 404, nil
 		}
 
 		now := time.Now().UTC()
@@ -816,23 +792,19 @@ func adminApproveTx(c *gin.Context) {
 		}
 		newExp := start.Add(time.Duration(tx.Days) * 24 * time.Hour)
 
-		_, err = database.Collection("users").UpdateOne(ctx, bson.M{"_id": targetUser.ID}, bson.M{
+		_, err = db.Collection("users").UpdateOne(ctx, bson.M{"_id": targetUser.ID}, bson.M{
 			"$set": bson.M{"expiryDate": newExp},
 			"$inc": bson.M{"total_purchases": 1},
 		})
-		if err != nil {
-			return nil, 500, err
-		}
 
-		_, err = database.Collection("transactions").UpdateOne(ctx, bson.M{"_id": oid}, bson.M{
-			"$set": bson.M{
-				"status":       "approved",
-				"approved_by":  admin.Username,
-				"processed_at": now,
-			},
-		})
-		if err != nil {
-			return nil, 500, err
+		if err == nil {
+			db.Collection("transactions").UpdateOne(ctx, bson.M{"_id": oid}, bson.M{
+				"$set": bson.M{
+					"status":       "approved",
+					"approved_by":  admin.Username,
+					"processed_at": now,
+				},
+			})
 		}
 
 		return map[string]string{"msg": "Approved", "new_expiry": newExp.Format(time.RFC3339)}, 200, nil
@@ -843,35 +815,26 @@ func adminApproveTx(c *gin.Context) {
 }
 
 func adminRejectTx(c *gin.Context) {
-	database, derr := getDB()
-	if derr != nil {
-		c.JSON(500, gin.H{"msg": "Service unavailable"})
-		return
-	}
-
 	txID := c.Param("tx_id")
-	admin := c.MustGet("user").(User)
+	uVal, _ := c.Get("user")
+	admin := uVal.(User)
 
-	var body struct{ Reason string `json:"reason"` }
-	c.ShouldBindJSON(&body)
-	if body.Reason == "" {
-		body.Reason = "No reason provided"
+	var body struct { Reason string `json:"reason"` }
+	// ShouldBind can leave fields empty, manual init check logic:
+	if err := c.ShouldBindJSON(&body); err != nil {
+		// Just continue if body empty or invalid
 	}
+	if body.Reason == "" { body.Reason = "No reason" }
 
 	task := func() (interface{}, int, error) {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		oid, err := primitive.ObjectIDFromHex(txID)
-		if err != nil {
-			return map[string]string{"msg": "Invalid ID format"}, 400, nil
-		}
+		if err != nil { return map[string]string{"msg": "ID error"}, 400, nil }
 
-		var tx Transaction
-		if err := database.Collection("transactions").FindOne(ctx, bson.M{"_id": oid, "status": "pending"}).Decode(&tx); err != nil {
-			return map[string]string{"msg": "Transaction not found or not pending"}, 404, nil
-		}
-
-		_, err = database.Collection("transactions").UpdateOne(ctx,
-			bson.M{"_id": oid},
+		res, err := db.Collection("transactions").UpdateOne(ctx,
+			bson.M{"_id": oid, "status": "pending"},
 			bson.M{"$set": bson.M{
 				"status":        "rejected",
 				"rejected_by":   admin.Username,
@@ -879,11 +842,10 @@ func adminRejectTx(c *gin.Context) {
 				"reject_reason": body.Reason,
 			}},
 		)
-
-		if err != nil {
-			return nil, 500, err
+		if err != nil || res.MatchedCount == 0 {
+			return map[string]string{"msg": "Update failed (not found/processed)"}, 404, nil
 		}
-		return map[string]string{"msg": "Transaction rejected successfully"}, 200, nil
+		return map[string]string{"msg": "Rejected"}, 200, nil
 	}
 
 	res, code, _ := SubmitJob(5, task, true)
@@ -891,31 +853,28 @@ func adminRejectTx(c *gin.Context) {
 }
 
 func manageCoupons(c *gin.Context) {
-	database, derr := getDB()
-	if derr != nil {
-		c.JSON(500, gin.H{"msg": "Service unavailable"})
-		return
-	}
-
 	if c.Request.Method == "GET" {
-		cursor, err := database.Collection("coupons").Find(context.Background(), bson.M{}, options.Find().SetSort(bson.M{"created_at": -1}))
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		cursor, err := db.Collection("coupons").Find(ctx, bson.M{}, options.Find().SetSort(bson.M{"created_at": -1}))
 		if err != nil {
 			c.JSON(500, gin.H{"msg": "DB error"})
 			return
 		}
-		defer cursor.Close(context.Background())
-
 		var coupons []Coupon
-		if err := cursor.All(context.Background(), &coupons); err != nil {
-			c.JSON(500, gin.H{"msg": "DB error"})
-			return
-		}
+		// IMPORTANT: Initialize to empty slice so JSON returns [] not null
+		coupons = []Coupon{} 
+		cursor.All(ctx, &coupons)
 
 		output := []gin.H{}
 		for _, cp := range coupons {
+			// Protection against nil slices in legacy data
 			usedByStrs := []string{}
-			for _, u := range cp.UsedBy {
-				usedByStrs = append(usedByStrs, u.Hex())
+			if cp.UsedBy != nil {
+				for _, u := range cp.UsedBy {
+					usedByStrs = append(usedByStrs, u.Hex())
+				}
 			}
 
 			item := gin.H{
@@ -938,6 +897,7 @@ func manageCoupons(c *gin.Context) {
 		return
 	}
 
+	// POST
 	var body struct {
 		Code      string     `json:"code" binding:"required"`
 		BonusDays int        `json:"bonus_days" binding:"required"`
@@ -945,7 +905,7 @@ func manageCoupons(c *gin.Context) {
 		ExpiresAt *time.Time `json:"expires_at"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"msg": err.Error()})
+		c.JSON(400, gin.H{"msg": "Validation error"})
 		return
 	}
 
@@ -955,156 +915,126 @@ func manageCoupons(c *gin.Context) {
 		MaxUses:   body.MaxUses,
 		ExpiresAt: body.ExpiresAt,
 		Uses:      0,
-		UsedBy:    []primitive.ObjectID{},
+		UsedBy:    []primitive.ObjectID{}, // Init empty slice
 		CreatedAt: time.Now().UTC(),
 	}
 
-	_, err := database.Collection("coupons").InsertOne(context.Background(), newC)
+	_, err := db.Collection("coupons").InsertOne(context.Background(), newC)
 	if mongo.IsDuplicateKeyError(err) {
 		c.JSON(409, gin.H{"msg": "Coupon code already exists"})
-		return
-	}
-	if err != nil {
-		c.JSON(500, gin.H{"msg": "DB error"})
 		return
 	}
 	c.JSON(201, gin.H{"msg": "Coupon created"})
 }
 
-// ----- STARTUP TASKS & CLEANUP -----
+// ----- STARTUP -----
 
 func ensureIndexesAndAdmin() {
-	database, err := getDB()
-	if err != nil {
-		log.Printf("ensureIndexesAndAdmin: db not ready: %v", err)
+	// استفاده از timeout جداگانه
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if db == nil {
+		log.Println("Skipping EnsureIndexes: DB not ready")
 		return
 	}
-	ctx := context.Background()
 
-	_, err = database.Collection("users").Indexes().CreateOne(ctx, mongo.IndexModel{
+	db.Collection("users").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "username", Value: 1}},
 		Options: options.Index().SetUnique(true),
 	})
-	if err != nil {
-		log.Printf("index users.username: %v", err)
-	}
-	_, err = database.Collection("transactions").Indexes().CreateOne(ctx, mongo.IndexModel{
+	db.Collection("transactions").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "tx_hash", Value: 1}},
 		Options: options.Index().SetUnique(true).SetSparse(true),
 	})
-	if err != nil {
-		log.Printf("index transactions.tx_hash: %v", err)
-	}
-	_, err = database.Collection("coupons").Indexes().CreateOne(ctx, mongo.IndexModel{
+	db.Collection("coupons").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "code", Value: 1}},
 		Options: options.Index().SetUnique(true),
 	})
-	if err != nil {
-		log.Printf("index coupons.code: %v", err)
-	}
 
+	// Bootstrap Admin
 	if cfg.AdminEnvUser != "" && cfg.AdminEnvPass != "" {
 		hash, _ := hashPassword(cfg.AdminEnvPass)
-		userColl := database.Collection("users")
+		userColl := db.Collection("users")
+		// Use specific find to avoid panic if collection empty/error
 		if err := userColl.FindOne(ctx, bson.M{"username": cfg.AdminEnvUser}).Err(); err == mongo.ErrNoDocuments {
-			_, err := userColl.InsertOne(ctx, User{
+			userColl.InsertOne(ctx, User{
 				Username:    cfg.AdminEnvUser,
 				Password:    hash,
 				Role:        "admin",
 				SessionSalt: "system",
 				CreatedAt:   time.Now().UTC(),
 			})
-			if err != nil {
-				log.Printf("bootstrap admin insert failed: %v", err)
-			} else {
-				log.Println("Bootstrap admin created")
-			}
+			log.Println("Bootstrap admin created")
 		}
 	}
 }
 
-func cleanupCouponsTask(stop <-chan struct{}) {
-	wg.Add(1)
-	defer wg.Done()
-
+func cleanupCouponsTask() {
+	// Simple ticker loop, recover protected
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("cleanupCouponsTask recovered: %v", r)
+			log.Printf("Cleanup Task Panic: %v", r)
 		}
 	}()
 
 	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
 	for {
 		select {
-		case <-stop:
-			log.Println("cleanupCouponsTask stopping")
+		case <-shutdownCh:
 			return
 		case <-ticker.C:
-			database, err := getDB()
-			if err != nil {
-				log.Printf("cleanupCouponsTask: db not ready: %v", err)
-				continue
-			}
-			res, err := database.Collection("coupons").DeleteMany(context.Background(), bson.M{
-				"expires_at": bson.M{"$lt": time.Now().UTC()},
-			})
-			if err != nil {
-				log.Printf("cleanupCouponsTask delete error: %v", err)
-				continue
-			}
-			if res.DeletedCount > 0 {
-				log.Printf("Deleted %d expired coupons", res.DeletedCount)
+			if db != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, _ = db.Collection("coupons").DeleteMany(ctx, bson.M{
+					"expires_at": bson.M{"$lt": time.Now().UTC()},
+				})
+				cancel()
 			}
 		}
 	}
 }
 
-// ----- MAIN -----
-
 func main() {
-	if err := loadConfig(); err != nil {
-		log.Fatalf("config error: %v", err)
-	}
+	log.Println("Starting Server...")
+	loadConfig()
+	connectDB() // This must block until connected
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := connectDB(ctx); err != nil {
-		log.Fatalf("mongo connect failed: %v", err)
-	}
-
+	// Heap must be initialized
 	heap.Init(&jobQueue)
+	
+	// Start workers after DB and Heap are ready
 	startWorkers(cfg.WorkerCount)
 
-	go ensureIndexesAndAdmin()
-	go cleanupCouponsTask(shutdownCh)
+	// Async Maintenance
+	go func() {
+		// Slight delay to allow full startup
+		time.Sleep(1 * time.Second)
+		ensureIndexesAndAdmin()
+		cleanupCouponsTask()
+	}()
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// Use Recovery middleware (catches Handler panics)
 	r.Use(gin.Recovery())
 
 	corsConfig := cors.DefaultConfig()
 	corsConfig.AllowAllOrigins = true
 	if origins := os.Getenv("FRONTEND_ORIGINS"); origins != "" {
 		corsConfig.AllowAllOrigins = false
-		parts := []string{}
-		for _, s := range strings.Split(origins, ",") {
-			if t := strings.TrimSpace(s); t != "" {
-				parts = append(parts, t)
-			}
-		}
-		corsConfig.AllowOrigins = parts
+		corsConfig.AllowOrigins = strings.Split(origins, ",")
 	}
 	corsConfig.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type", "Authorization"}
-	corsConfig.AllowMethods = []string{"GET", "POST", "OPTIONS"}
+	corsConfig.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	r.Use(cors.New(corsConfig))
 
+	// Routes
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"service":        "TwoManga API",
-			"mode":           "Worker Queue PRO (Go)",
-			"workers_active": cfg.WorkerCount,
-			"db":             mongoClient != nil,
+			"status":         "healthy",
+			"workers":        cfg.WorkerCount,
 		})
 	})
 
@@ -1138,38 +1068,32 @@ func main() {
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %s\n", err)
+			log.Fatalf("Listen error: %s\n", err)
 		}
 	}()
-	log.Printf("Server running on port %s", cfg.Port)
+	log.Printf("Server listening on port %s", cfg.Port)
 
+	// Graceful Shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("Shutting down...")
 
+	// 1. Signal workers to stop
 	close(shutdownCh)
 
-	ctxShut, cancelShut := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelShut()
-	if err := srv.Shutdown(ctxShut); err != nil {
-		log.Fatalf("Server Shutdown: %v", err)
+	// 2. Stop Web Server
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Println("Server Shutdown Force:", err)
 	}
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		log.Println("Timeout waiting for goroutines to finish")
-	}
-
+	
+	// 3. Close DB
 	if mongoClient != nil {
-		_ = mongoClient.Disconnect(context.Background())
+		mongoClient.Disconnect(context.Background())
+		log.Println("DB Disconnected")
 	}
-
 	log.Println("Bye.")
 }
